@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# droidB-mod 0.0.1 - root/ROM helpers for droidB:
+#   magisk-patch <boot.img> [magisk.apk]   patch a boot image with Magisk -> *_magisk.img
+#   payload <payload.bin|ota.zip> [outdir]  dump partitions from an OTA payload
+#   super   <super.img> [outdir]            unpack a super (dynamic partitions) image
+set -u
+AC=$'\033[38;5;208m'; RD=$'\033[1;31m'; DM=$'\033[90m'; RS=$'\033[0m'
+say(){ printf "  ${AC}>>${RS} %s\n" "$*"; }
+err(){ printf "  ${RD}xx${RS} %s\n" "$*"; }
+need(){ command -v "$1" >/dev/null 2>&1; }
+pac(){ sudo pacman -S --noconfirm --needed "$@" >/dev/null 2>&1 || yay -S --noconfirm "$@" >/dev/null 2>&1; }
+
+magisk_patch(){
+  local boot="$1" apk="${2:-}"
+  [ -f "$boot" ] || { err "boot image not found: $boot"; return 1; }
+  need unzip || pac unzip; need curl || pac curl
+  local work; work=$(mktemp -d /tmp/droidB-magisk.XXXXXX)
+  if [ -z "$apk" ]; then
+    say "fetching the latest Magisk…"
+    local url; url=$(curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest 2>/dev/null \
+                     | grep -oE 'https://[^"]+(app-release\.apk|Magisk-v[0-9.]+\.apk)' | head -1)
+    [ -z "$url" ] && { err "could not resolve a Magisk release"; return 1; }
+    apk="$work/magisk.apk"; curl -fsSL "$url" -o "$apk" || { err "download failed"; return 1; }
+  fi
+  say "unpacking Magisk binaries"
+  unzip -o -q "$apk" -d "$work/m" || { err "not a valid Magisk apk"; return 1; }
+  local hb=""; for a in x86_64 x86; do [ -f "$work/m/lib/$a/libmagiskboot.so" ] && hb="$work/m/lib/$a/libmagiskboot.so" && break; done
+  [ -z "$hb" ] && { err "magiskboot not found in apk"; return 1; }
+  ( cd "$work" || exit 1
+    cp "$hb" magiskboot; chmod +x magiskboot; cp "$boot" boot.img
+    for a in arm64-v8a armeabi-v7a x86_64 x86; do
+      for f in libmagiskinit.so libmagisk64.so libmagisk32.so libinit-ld.so; do
+        [ -f "m/lib/$a/$f" ] && cp -n "m/lib/$a/$f" "${f#lib}" 2>/dev/null
+      done
+    done
+    [ -f libmagisk64.so ] && cp -n libmagisk64.so magisk64 2>/dev/null
+    [ -f libmagisk32.so ] && cp -n libmagisk32.so magisk32 2>/dev/null
+    say "patching boot image"
+    if [ -f m/assets/boot_patch.sh ]; then
+      PATH="$work:$PATH" KEEPVERITY=true KEEPFORCEENCRYPT=true sh m/assets/boot_patch.sh boot.img
+    else err "this Magisk build needs on-device patching (install the Magisk app, Install -> Patch a file)"; exit 1; fi
+  ) || return 1
+  local out; out="${boot%.*}_magisk.img"
+  [ -f "$work/new-boot.img" ] && { cp -f "$work/new-boot.img" "$out"; say "patched boot -> ${AC}$out${RS}"; echo "$out"; } \
+                              || { err "no patched image produced"; return 1; }
+  rm -rf "$work"
+}
+
+payload_extract(){
+  local pl="$1" out="${2:-$(dirname "$1")/extracted}"; mkdir -p "$out"
+  need payload-dumper-go || { say "installing payload-dumper-go"; pac payload-dumper-go; }
+  case "$pl" in *.zip) need unzip || pac unzip; say "extracting payload.bin from the OTA zip"; unzip -o -q "$pl" payload.bin -d "$out"; pl="$out/payload.bin";; esac
+  [ -f "$pl" ] || { err "no payload.bin"; return 1; }
+  say "dumping partitions -> $out"; payload-dumper-go -o "$out" "$pl" && say "done"
+}
+
+super_extract(){
+  local sup="$1" out="${2:-$(dirname "$1")/super}"; mkdir -p "$out"
+  need lpunpack || pac android-tools lpunpack
+  if file "$sup" 2>/dev/null | grep -qi sparse; then
+    need simg2img || pac android-tools
+    say "converting sparse -> raw"; simg2img "$sup" "$out/super.raw" && sup="$out/super.raw"
+  fi
+  say "unpacking super -> $out"; lpunpack "$sup" "$out" && say "done"
+}
+
+case "${1:-}" in
+  magisk-patch) shift; magisk_patch "$@";;
+  payload)      shift; payload_extract "$@";;
+  super)        shift; super_extract "$@";;
+  *) echo "usage: droidB-mod {magisk-patch <boot.img> [apk] | payload <payload.bin|ota.zip> [out] | super <super.img> [out]}";;
+esac
