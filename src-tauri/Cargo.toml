@@ -1,0 +1,23 @@
+[package]
+name = "droidB-gui-native"
+version = "0.1.0"
+edition = "2021"
+description = "droidB GUI — the ArxOS Android toolkit, native (Tauri v2)"
+authors = ["0xb0rn3"]
+build = "build.rs"
+
+# distinct from `droidB-gui` (the existing Python/GTK app this is meant to eventually
+# replace, per the "full UI redesign" ask) so installing this during development never
+# overwrites the one people currently use. The cutover — retargeting droidB.desktop's
+# Exec= and install.sh — is a deliberate later step once this is feature-complete.
+[[bin]]
+name = "droidB-gui-native"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

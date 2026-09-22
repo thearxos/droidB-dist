@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# droidB-samsung 0.0.2 - Samsung firmware flasher, dual backend.
+#   odin4    (default) hands the BL/AP/CP/CSC/USERDATA tar.md5 straight to Samsung's Thor
+#            protocol; it pulls the device's own PIT and resolves partitions itself, so it
+#            never hits the filename-vs-PIT mismatch (e.g. dspso -> DSP, hypvm -> HYP) that
+#            trips heimdall. No extraction / lz4 needed. This is the path that just works.
+#   heimdall extracts the tar.md5 + lz4 and flashes per-partition using a CORRECTED PIT map
+#            (the naive filename-stem approach fails on Snapdragon Samsungs).
+# Device must be in Download mode (modern models: Vol-Down + Vol-Up, then plug in USB).
+# USB access: /etc/udev/rules.d/51-android.rules -> SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", MODE="0666"
+#
+# Usage:
+#   droidB-samsung [--backend odin4|heimdall] [--dir DIR | FILE...] [options]
+#   options: --preserve-data (HOME_CSC, keep userdata)  --reboot  --validate  --detect
+#            --nand-erase --force (odin4 repartition, destructive)  --device PATH (odin4)
+set -u
+GR=$'\033[1;32m'; RD=$'\033[1;31m'; DM=$'\033[90m'; AC=$'\033[38;5;208m'; BD=$'\033[1m'; RS=$'\033[0m'
+say(){ printf "  ${GR}>>${RS} %s\n" "$*"; }
+err(){ printf "  ${RD}xx${RS} %s\n" "$*"; }
+inf(){ printf "  ${DM}.. %s${RS}\n" "$*"; }
+
+BACKEND=""; DIR=""; FILES=(); PRESERVE=0; REBOOT=0; VALIDATE=0; NAND=0; FORCE=0; DEV=""; DETECT=0
+while [ $# -gt 0 ]; do case "$1" in
+  --backend) BACKEND="${2:-}"; shift 2;;
+  --dir) DIR="${2:-}"; shift 2;;
+  --preserve-data) PRESERVE=1; shift;;
+  --reboot) REBOOT=1; shift;;
+  --validate) VALIDATE=1; shift;;
+  --nand-erase) NAND=1; shift;;
+  --force) FORCE=1; shift;;
+  --device) DEV="${2:-}"; shift 2;;
+  --detect) DETECT=1; shift;;
+  *) FILES+=("$1"); shift;;
+esac; done
+
+# default backend: prefer odin4 (works without a PIT map), else heimdall
+[ -z "$BACKEND" ] && { command -v odin4 >/dev/null 2>&1 && BACKEND=odin4 || BACKEND=heimdall; }
+# firmware dir: --dir, else the dir of the first FILE, else cwd
+[ -z "$DIR" ] && [ "${#FILES[@]}" -gt 0 ] && DIR="$(cd "$(dirname "${FILES[0]}")" 2>/dev/null && pwd)"
+[ -z "$DIR" ] && DIR="$(pwd)"
+find1(){ ls "$DIR"/$1 2>/dev/null | head -1 || true; }
+
+detect_dev(){
+  say "looking for a Samsung device in Download mode…"
+  command -v odin4    >/dev/null 2>&1 && { inf "odin4 -l:";        odin4 -l 2>&1 | sed 's/^/     /'; }
+  command -v heimdall >/dev/null 2>&1 && { inf "heimdall detect:"; heimdall detect 2>&1 | sed 's/^/     /'; }
+  inf "usb (Samsung 04e8):"; lsusb 2>/dev/null | grep -i "04e8" | sed 's/^/     /' || echo "     (none seen)"
+}
+[ "$DETECT" = 1 ] && { detect_dev; exit 0; }
+
+flash_odin4(){
+  command -v odin4 >/dev/null 2>&1 || { err "odin4 not installed - install the ARXOS open engine: arx install droidB-thor"; exit 1; }
+  local BL AP CP CSC UD=""
+  BL=$(find1 "BL_*.tar.md5"); AP=$(find1 "AP_*.tar.md5"); CP=$(find1 "CP_*.tar.md5")
+  if [ "$PRESERVE" = 1 ]; then CSC=$(find1 "HOME_CSC_*.tar.md5"); else CSC=$(find1 "CSC_*.tar.md5"); UD=$(find1 "USERDATA_*.tar.md5"); fi
+  say "odin4 slots:"
+  printf "    ${BD}BL ${RS}${DM}<- %s${RS}\n" "${BL:-<none>}"; printf "    ${BD}AP ${RS}${DM}<- %s${RS}\n" "${AP:-<none>}"
+  printf "    ${BD}CP ${RS}${DM}<- %s${RS}\n" "${CP:-<none>}"; printf "    ${BD}CSC${RS} ${DM}<- %s${RS}\n" "${CSC:-<none>}"
+  [ "$PRESERVE" = 0 ] && printf "    ${BD}UMS${RS} ${DM}<- %s${RS}\n" "${UD:-<none>}"
+  [ -z "${BL}${AP}${CP}${CSC}" ] && { err "no BL/AP/CP/CSC tar.md5 found in $DIR"; exit 1; }
+  local CMD=(odin4)
+  [ -n "$BL" ] && CMD+=(-b "$BL"); [ -n "$AP" ] && CMD+=(-a "$AP")
+  [ -n "$CP" ] && CMD+=(-c "$CP"); [ -n "$CSC" ] && CMD+=(-s "$CSC")
+  [ "$PRESERVE" = 0 ] && [ -n "$UD" ] && CMD+=(-u "$UD")
+  [ "$VALIDATE" = 1 ] && CMD+=(-V)
+  if [ "$NAND" = 1 ]; then { [ "$FORCE" = 1 ] && { say "NAND erase / repartition (-e)"; CMD+=(-e); }; } || err "--nand-erase needs --force too (safety) - ignoring"; fi
+  [ -n "$DEV" ] && CMD+=(-d "$DEV")
+  [ "$REBOOT" = 1 ] && CMD+=(--reboot)
+  printf "\n"; say "running: ${CMD[*]}"; say "flashing via odin4 (do not unplug)…"
+  "${CMD[@]}"; local rc=$?
+  [ $rc -eq 0 ] && say "flash complete" || err "odin4 failed (rc=$rc) - check Download mode + udev(04e8) + cable"
+  return $rc
+}
+
+flash_heimdall(){
+  command -v heimdall >/dev/null 2>&1 || { err "heimdall not installed (arx install heimdall)"; exit 1; }
+  command -v lz4 >/dev/null 2>&1 || sudo pacman -S --noconfirm --needed lz4 >/dev/null 2>&1 || true
+  local W; W=$(mktemp -d /tmp/droidB-samsung.XXXXXX)
+  say "extracting firmware into $W"
+  local t b
+  for t in "$DIR"/*.tar.md5 "$DIR"/*.tar; do [ -f "$t" ] || continue; b="${t##*/}"
+    case "$b" in HOME_CSC_*) [ "$PRESERVE" = 1 ] || continue;; CSC_*) [ "$PRESERVE" = 0 ] || continue;; USERDATA_*) [ "$PRESERVE" = 0 ] || continue;; esac
+    inf "unpack $b"; tar -xf "$t" -C "$W" 2>/dev/null || true; done
+  local z; for z in "$W"/*.lz4; do [ -e "$z" ] || continue; inf "lz4 ${z##*/}"; lz4 -d -f -q "$z" "${z%.lz4}" 2>/dev/null && rm -f "$z"; done
+  # filename -> ACTUAL PIT partition name (the fix: heimdall's filename-stem guess is wrong
+  # for these - dspso!=DSPSO, hypvm!=HYPVM, km41!=KEYMASTER, tz_hdm!=HDM, non-hlos!=APNHLOS...)
+  declare -A PIT=( [abl.elf]=ABL [aop.mbn]=AOP [apdp.mbn]=APDP [bksecapp.mbn]=BKSECAPP [boot.img]=BOOT
+    [cache.img]=CACHE [carrier.img]=CARRIER [cpucp.elf]=CPUCP [devcfg.mbn]=DEVCFG [dspso.bin]=DSP
+    [dtbo.img]=DTBO [engmode.mbn]=EM [hypvm.mbn]=HYP [km41.mbn]=KEYMASTER [misc.bin]=MISC [modem.bin]=MODEM
+    [NON-HLOS.bin]=APNHLOS [omr.img]=OMR [optics.img]=OPTICS [persist.img]=PERSIST [prism.img]=PRISM
+    [qupv3fw.elf]=QUPFW [quest.fv]=TOOLSFV [recovery.img]=RECOVERY [sec.elf]=SECDATA [shrm.elf]=SHRM
+    [spunvm.bin]=SPUNVM [storsec.mbn]=STORSEC [super.img]=SUPER [testvector.fv]=LOGDUMP [tz_hdm.mbn]=HDM
+    [tz_iccc.mbn]=TZICCC [tz_kg.mbn]=TZ_KG [tz.mbn]=TZ [uefi_sec.mbn]=UEFISECAPP [userdata.img]=USERDATA
+    [vaultkeeper.mbn]=VK [vbmeta.img]=VBMETA [vbmeta_system.img]=VBMETA_SYSTEM [vendor_boot.img]=VENDOR_BOOT
+    [xbl_config.elf]=XBL_CONFIG [xbl.elf]=XBL )
+  say "partitions to flash (PIT-corrected):"
+  local A=() f n=0; [ "$REBOOT" = 0 ] && A+=(--no-reboot)
+  for f in "${!PIT[@]}"; do [ -f "$W/$f" ] || continue; { [ "$f" = userdata.img ] && [ "$PRESERVE" = 1 ]; } && continue
+    printf "    ${BD}%-14s${RS} ${DM}<- %s${RS}\n" "${PIT[$f]}" "$f"; A+=(--"${PIT[$f]}" "$W/$f"); n=$((n+1)); done
+  [ "$n" = 0 ] && { err "nothing matched; leaving $W for inspection"; return 1; }
+  printf "\n"; say "running heimdall flash (do not unplug)…"
+  heimdall flash "${A[@]}"; local rc=$?
+  { [ $rc -eq 0 ] && { say "flash complete"; rm -rf "$W"; }; } || err "heimdall failed (rc=$rc); extracted files kept in $W"
+  return $rc
+}
+
+say "backend: ${AC}$BACKEND${RS}   firmware: ${AC}$DIR${RS}"
+case "$BACKEND" in
+  odin4)    flash_odin4 ;;
+  heimdall) flash_heimdall ;;
+  *) err "unknown backend '$BACKEND' (use odin4 or heimdall)"; exit 1 ;;
+esac
