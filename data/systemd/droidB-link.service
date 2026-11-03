@@ -1,0 +1,13 @@
+[Unit]
+Description=droidB link keeper (reconnect saved wireless devices over LAN/WAN)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/droidB-link --interval 30
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

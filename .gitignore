@@ -1,0 +1,3 @@
+/target
+# libodin4 drops a log next to the working directory when the Samsung path runs
+odin4.log

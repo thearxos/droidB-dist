@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""droidB deep audit + type grouping for one device's backup (Android or iOS).
+
+usage:
+  droidB-audit --backup <dir> --out <path> [--label NAME] [--platform android|ios|auto]
+  droidB-audit --fleet <spec>...   where each spec is  label:platform:backup_dir  (runs concurrently)
+
+Read-only over the backup. Every file is inventoried (path, size, sha256, type), the platform
+databases are read where present, and files are grouped by type into <out>/<label>/by_type/<cat>/<ext>/
+as hard links (no extra space). A per-device report and, for a fleet, a combined index are written.
+Nothing in the backup is modified; the source bytes are hashed, not moved.
+
+This is the grouping/audit stage of the deep backup+audit pipeline; the backup stage (adb rescue /
+idevicebackup2) runs before it and the fleet runner drives both across many devices concurrently.
+"""
+import argparse, csv, hashlib, os, plistlib, sqlite3, sys, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+CHUNK = 1 << 20
+
+# category -> extensions. Order matters only for display; lookup is by extension.
+# Extensions are grouped from the categories below; anything not listed falls into Other, still
+# split by its own extension. The set was tuned against the real extensions seen in an iPhone
+# backup (20k+ files) and an Android rescue backup (2026-11-02), so the common, meaningful types
+# land in a named bucket and only genuinely app-private blobs reach Other.
+TYPES = {
+    "Images":          {"jpg","jpeg","heic","heif","png","gif","tif","tiff","dng","webp","bmp","raw","cr2","nef","arw","aae"},
+    "Videos":          {"mov","mp4","m4v","hevc","3gp","3gpp","avi","mkv","webm","mpg","mpeg"},
+    "Audio":           {"aac","m4a","wav","caf","mp3","flac","ogg","opus","amr","aiff"},
+    "Documents":       {"pdf","doc","docx","xls","xlsx","ppt","pptx","txt","rtf","csv","md","pages","numbers","key","epub"},
+    "Databases":       {"sqlite","sqlite3","sqlitedb","db","sql","realm","ldb","mmap","leveldb"},
+    "Thumbnail caches":{"ithmb","thumbdata","thm","thumb","mmsthumb","videothumb"},
+    "Apps":            {"apk","apks","xapk","ipa","aab"},
+    "Archives":        {"zip","tar","gz","tgz","7z","rar","ab","bz2","xz","zst"},
+    "Property lists":  {"plist"},
+    "Fonts":           {"ttf","otf","woff","woff2","ttc"},
+    "Config":          {"ovpn","conf","cfg","mobileconfig","pac","ini","pem","crt","cer","p12"},
+    "Contacts and calendars":    {"vcf","ics","vcard"},
+    "Web and code":        {"html","htm","js","css","json","xml"},
+    "Logs and markers":    {"log","nomedia"},
+    "Cookies/State":       {"binarycookies","idstatuscache","plsql"},
+    # app-private data blobs seen across a real iPhone backup: internal formats with no universal
+    # media type. Grouped together (and split by extension) so they do not swamp Other.
+    "App data":            {"locked","wl","pluginpayloadattachment","bin","ahe","proton","was","data",
+                            "identifier","mdbackup","mddata","itdb","itl","dat","temp","sqlitedb-wal",
+                            "store","cache","archive","blob","state","ckrecord","pb","facemetadata","albummetadata",
+                            "memorymetadata","foldermetadata","suggestions","tlog","bnk","pma","aea",
+                            "encrypted","archiver","lock","old","strings","mil","mmp","aar","cloudphotodb"},
+}
+EXT2CAT = {e: c for c, exts in TYPES.items() for e in exts}
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(CHUNK), b""):
+            h.update(b)
+    return h.hexdigest()
+
+def classify(name):
+    ext = name.rsplit(".", 1)[1].lower() if "." in name else ""
+    low = name.lower()
+    for suf in ("-wal", "-shm", "-journal"):   # any SQLite sidecar
+        if low.endswith(suf):
+            return "Databases", suf.lstrip("-")
+    if not ext:
+        return "App data", "no-extension"
+    return EXT2CAT.get(ext, "Other"), ext
+
+def detect_platform(backup):
+    if os.path.isfile(os.path.join(backup, "Manifest.plist")) or os.path.isfile(os.path.join(backup, "Status.plist")):
+        return "ios"
+    # an Android rescue backup carries these text dumps
+    for n in ("device-props.txt", "apps-user.txt", "MANIFEST.txt"):
+        if os.path.isfile(os.path.join(backup, n)):
+            return "android"
+    return "unknown"
+
+def ios_photo_records(backup, reports):
+    """If a Photos.sqlite is in the iOS backup, record its asset/trash counts (read-only)."""
+    # the iOS backup lays files out as <first two hex>/<fileID>; Manifest.db maps names -> fileID
+    man = os.path.join(backup, "Manifest.db")
+    if not os.path.isfile(man):
+        return None
+    import shutil, tempfile
+    tmp = tempfile.mkdtemp()
+    shutil.copy2(man, os.path.join(tmp, "Manifest.db"))
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % os.path.join(tmp, "Manifest.db"), uri=True)
+        row = con.execute("SELECT fileID FROM Files WHERE lower(relativePath) LIKE '%photos.sqlite' "
+                          "AND domain LIKE '%CameraRoll%' LIMIT 1").fetchone()
+        con.close()
+        if not row:
+            return {"photos_sqlite": "not found"}
+        fid = row[0]
+        phys = os.path.join(backup, fid[:2], fid)
+        if not os.path.isfile(phys):
+            return {"photos_sqlite": "listed but missing"}
+        shutil.copy2(phys, os.path.join(tmp, "Photos.sqlite"))
+        pc = sqlite3.connect("file:%s?mode=ro" % os.path.join(tmp, "Photos.sqlite"), uri=True)
+        tables = {r[0] for r in pc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        at = "ZASSET" if "ZASSET" in tables else ("ZGENERICASSET" if "ZGENERICASSET" in tables else None)
+        out = {}
+        if at:
+            cols = {r[1] for r in pc.execute("PRAGMA table_info(%s)" % at)}
+            out["assets"] = pc.execute("SELECT COUNT(*) FROM %s" % at).fetchone()[0]
+            if "ZTRASHEDSTATE" in cols:
+                out["recently_deleted"] = pc.execute("SELECT COUNT(*) FROM %s WHERE ZTRASHEDSTATE=1" % at).fetchone()[0]
+        pc.close()
+        return out
+    except sqlite3.Error as e:
+        return {"photos_sqlite_error": str(e)}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+def audit_one(label, platform, backup, out_root):
+    if platform in (None, "auto", ""):
+        platform = detect_platform(backup)
+    dev_out = os.path.join(out_root, label)
+    by_type = os.path.join(dev_out, "by_type")
+    reports = os.path.join(dev_out, "reports")
+    for d in (by_type, reports):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+
+    rows = []
+    cat_counts = {}
+    used = set()
+    total_bytes = 0
+
+    def place(src, logical_name, rel):
+        """hash one file, classify it by its LOGICAL name, and hard-link it into by_type."""
+        nonlocal total_bytes
+        try:
+            size = os.path.getsize(src)
+        except OSError:
+            return
+        cat, ext = classify(logical_name)
+        digest = sha256(src)
+        rows.append((rel, size, digest, cat, ext))
+        total_bytes += size
+        cat_counts[(cat, ext)] = cat_counts.get((cat, ext), 0) + 1
+        tdir = os.path.join(by_type, cat, ext)
+        os.makedirs(tdir, exist_ok=True)
+        flat = rel.replace(os.sep, "__").replace("\x00", "")[-180:]
+        link = os.path.join(tdir, flat); k = 2
+        while os.path.lexists(link) or link in used:
+            stem, e = os.path.splitext(os.path.join(tdir, flat)); link = "%s-%d%s" % (stem, k, e); k += 1
+        used.add(link)
+        try:
+            os.link(src, link)
+        except OSError:
+            import shutil; shutil.copyfile(src, link)
+
+    man = os.path.join(backup, "Manifest.db")
+    if platform == "ios" and os.path.isfile(man):
+        # iOS stores every file as <first two hex of fileID>/<fileID>, with no extension; the real
+        # name is the relativePath in Manifest.db. Classify by that, so types are accurate.
+        import shutil, tempfile
+        tmp = tempfile.mkdtemp()
+        shutil.copy2(man, os.path.join(tmp, "Manifest.db"))
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % os.path.join(tmp, "Manifest.db"), uri=True)
+            cols = [r[1] for r in con.execute("PRAGMA table_info(Files)")]
+            flagcol = ", flags" if "flags" in cols else ", 1"
+            for fid, domain, rp, flags in con.execute("SELECT fileID, domain, relativePath%s FROM Files" % flagcol):
+                if not fid or not rp or flags != 1:   # flags==1 is a regular file
+                    continue
+                src = os.path.join(backup, fid[:2], fid)
+                if not os.path.isfile(src) or os.path.islink(src):
+                    continue
+                place(src, os.path.basename(rp), (domain or "") + "/" + rp)
+            con.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        for dirpath, _dirs, files in os.walk(backup):
+            for fn in files:
+                src = os.path.join(dirpath, fn)
+                if os.path.islink(src):
+                    continue
+                place(src, fn, os.path.relpath(src, backup))
+
+    with open(os.path.join(reports, "inventory.csv"), "w", newline="") as f:
+        w = csv.writer(f); w.writerow(["relpath", "size", "sha256", "category", "ext"]); w.writerows(rows)
+
+    extra = ios_photo_records(backup, reports) if platform == "ios" else None
+
+    lines = ["# %s deep audit (%s)" % (label, platform), ""]
+    lines.append("files: %d, %.2f GB" % (len(rows), total_bytes / 1e9))
+    lines.append("")
+    lines.append("## By type")
+    for (cat, ext), n in sorted(cat_counts.items(), key=lambda kv: (kv[0][0], -kv[1])):
+        lines.append("- %s / %s: %d" % (cat, ext, n))
+    if extra:
+        lines.append("")
+        lines.append("## iOS photo library")
+        for k, v in extra.items():
+            lines.append("- %s: %s" % (k, v))
+    lines.append("")
+    lines.append("Read-only audit. A thumbnail is not a full-resolution original; recently deleted is "
+                 "not permanently deleted. Grouped files in by_type/ are hard links to the backup copies.")
+    with open(os.path.join(reports, "summary.md"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    cats = {}
+    for (cat, _ext), n in cat_counts.items():
+        cats[cat] = cats.get(cat, 0) + n
+    return {"label": label, "platform": platform, "files": len(rows), "bytes": total_bytes,
+            "by_category": cats, "out": dev_out, "extra": extra}
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--backup"); ap.add_argument("--out", required=True)
+    ap.add_argument("--label", default=None); ap.add_argument("--platform", default="auto")
+    ap.add_argument("--fleet", nargs="*", default=None, help="label:platform:backup_dir ... run concurrently")
+    ap.add_argument("--workers", type=int, default=4)
+    a = ap.parse_args()
+    out_root = os.path.realpath(os.path.expanduser(a.out))
+    os.makedirs(out_root, mode=0o700, exist_ok=True)
+
+    jobs = []
+    if a.fleet:
+        for spec in a.fleet:
+            parts = spec.split(":", 2)
+            if len(parts) != 3:
+                print("bad fleet spec (want label:platform:dir):", spec); sys.exit(2)
+            jobs.append(tuple(parts))
+    elif a.backup:
+        label = a.label or os.path.basename(a.backup.rstrip("/")) or "device"
+        jobs.append((label, a.platform, a.backup))
+    else:
+        print("give --backup or --fleet"); sys.exit(2)
+
+    for _l, _p, b in jobs:
+        if not os.path.isdir(b):
+            print("not a directory:", b); sys.exit(2)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max(1, min(a.workers, len(jobs)))) as ex:
+        futs = {ex.submit(audit_one, l, p, b, out_root): l for (l, p, b) in jobs}
+        for fut in as_completed(futs):
+            r = fut.result(); results.append(r)
+            print("  audited %-20s %-8s %6d files  %6.2f GB  -> %s" % (
+                r["label"], r["platform"], r["files"], r["bytes"] / 1e9, r["out"]))
+
+    # combined index across devices
+    with open(os.path.join(out_root, "index.md"), "w") as f:
+        f.write("# droidB deep audit index\n\n")
+        f.write("%d device(s) audited %s\n\n" % (len(results), time.strftime("%Y-%m-%d %H:%M")))
+        for r in sorted(results, key=lambda x: x["label"]):
+            f.write("## %s (%s)\n\n- files: %d, %.2f GB\n" % (r["label"], r["platform"], r["files"], r["bytes"] / 1e9))
+            for cat, n in sorted(r["by_category"].items(), key=lambda kv: -kv[1]):
+                f.write("  - %s: %d\n" % (cat, n))
+            f.write("\n")
+    print("\nindex: %s" % os.path.join(out_root, "index.md"))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""droidB-link: keep saved wireless devices connected, independent of the GUI.
+
+Runs as a small systemd user service so the connection survives the GUI being closed and the laptop
+rebooting. Every interval it runs `adb connect <addr>` for each saved device marked keep=on; adb
+connect to an already-connected device is a cheap no-op, so a link dropped by a laptop reboot, a
+phone power-cut (common with East-Africa blackouts), a router outage or roaming Wi-Fi<->cellular
+self-heals with no manual step. The WAN link itself rides a WireGuard/Tailscale tunnel (secure, free
+relays, stable address); this just keeps the adb session re-established over it.
+
+usage: droidB-link [--interval SECONDS] [--once]
+"""
+import argparse, json, os, subprocess, sys, time
+
+def store():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "droidB", "devices.json")
+
+def entries():
+    try:
+        return json.load(open(store()))
+    except Exception:
+        return {}
+
+def kept():
+    return [(a, m) for a, m in entries().items() if isinstance(m, dict) and m.get("keep")]
+
+def discover_port(host, dport=8099, timeout=6):
+    """Ask the phone's arxlink-port helper (over the tunnel) for its current wireless-ADB port, so a
+    reboot that changed the dynamic port is handled automatically. Returns an ip:port or None."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://%s:%d/" % (host, dport), timeout=timeout) as r:
+            port = r.read().decode().strip()
+        if port.isdigit():
+            return "%s:%s" % (host, port)
+    except Exception:
+        return None
+    return None
+
+def tick():
+    reconnected = []
+    for addr, meta in kept():
+        target = addr
+        # if the device publishes its adb port over the tunnel (reboot changed it), rediscover it
+        if meta.get("discover"):
+            host = addr.rsplit(":", 1)[0]
+            found = discover_port(host, int(meta.get("discover_port", 8099)))
+            if found:
+                target = found
+        try:
+            r = subprocess.run(["adb", "connect", target], capture_output=True, text=True, timeout=15)
+            if "connected" in (r.stdout + r.stderr).lower():
+                reconnected.append(target)
+        except Exception:
+            pass
+    return reconnected
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--interval", type=int, default=30)
+    ap.add_argument("--once", action="store_true")
+    a = ap.parse_args()
+    if a.once:
+        print("reconnected:", ", ".join(tick()) or "none"); return
+    # start the adb server once so connects are fast
+    try: subprocess.run(["adb", "start-server"], capture_output=True, timeout=15)
+    except Exception: pass
+    while True:
+        tick()
+        time.sleep(max(10, a.interval))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

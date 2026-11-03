@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""droidB deep recovery: carve deleted records out of the SQLite databases in a device backup.
+
+usage:
+  droidB-recover --backup <dir> --out <path> [--label NAME]
+  droidB-recover --db <file.sqlite> --out <path>
+
+When a row is deleted from a SQLite database the page cell is unlinked but the record bytes usually
+stay in the page's unallocated area and freeblocks until the database is vacuumed or the space is
+reused. Phones keep SMS, call logs, contacts, chat messages and photo metadata in SQLite, so those
+remnants are recoverable from a plain backup, with no root and no raw flash image. This carver walks
+every page of every database and reconstructs records that are no longer referenced by any table.
+
+This is the backup-level half of deep recovery (what Recuva does from a live filesystem, done here
+from the databases a backup already contains). True free-space carving of a whole partition needs a
+raw image (rooted Android: a userdata dump); that is the --raw path, not implemented here yet.
+
+Read-only: the source databases are copied before they are opened, never modified.
+"""
+import argparse, csv, glob, os, shutil, sqlite3, struct, sys, tempfile
+
+def varint(buf, off):
+    """SQLite varint: 1-9 bytes, big-endian, high bit = continue. Returns (value, bytes_read)."""
+    v = 0
+    for i in range(9):
+        if off + i >= len(buf):
+            return None, 0
+        b = buf[off + i]
+        if i == 8:
+            v = (v << 8) | b
+            return v, 9
+        v = (v << 7) | (b & 0x7f)
+        if not (b & 0x80):
+            return v, i + 1
+    return v, 9
+
+def serial_len(t):
+    if t <= 4: return t
+    if t == 5: return 6
+    if t == 6 or t == 7: return 8
+    if t == 8 or t == 9: return 0
+    if t >= 12: return (t - 12) // 2 if t % 2 == 0 else (t - 13) // 2
+    return 0
+
+def read_value(buf, off, t):
+    n = serial_len(t)
+    if off + n > len(buf):
+        return None, 0
+    raw = buf[off:off + n]
+    if t == 0: return None, 0
+    if t == 8: return 0, 0
+    if t == 9: return 1, 0
+    if 1 <= t <= 6:
+        val = int.from_bytes(raw, "big", signed=True); return val, n
+    if t == 7:
+        return struct.unpack(">d", raw)[0] if n == 8 else None, n
+    if t >= 13 and t % 2 == 1:   # text
+        try: return raw.decode("utf-8", "replace"), n
+        except Exception: return raw.hex(), n
+    return raw.hex(), n   # blob
+
+def try_record(buf, off, min_cols=2, max_cols=64):
+    """Try to parse a SQLite record at off. Returns (values, total_len) or (None, 0)."""
+    hdr_len, hn = varint(buf, off)
+    if hdr_len is None or hn == 0 or hdr_len < hn or hdr_len > 4096 or off + hdr_len > len(buf):
+        return None, 0
+    types = []
+    p = off + hn
+    while p < off + hdr_len:
+        t, n = varint(buf, p)
+        if t is None or n == 0: return None, 0
+        if t == 10 or t == 11: return None, 0   # reserved -> not a real record
+        types.append(t); p += n
+    if not (min_cols <= len(types) <= max_cols):
+        return None, 0
+    vals = []; vp = off + hdr_len
+    for t in types:
+        v, n = read_value(buf, vp, t)
+        if v is None and t != 0 and t not in (8, 9):
+            return None, 0
+        vals.append(v); vp += n
+    if vp - off < 4:
+        return None, 0
+    return vals, vp - off
+
+def live_records(db_path):
+    """The records still referenced by a table, so we can separate deleted from live."""
+    con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    live = set()
+    try:
+        tabs = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        for t in tabs:
+            try:
+                for row in con.execute('SELECT * FROM "%s"' % t):
+                    live.add(tuple("" if v is None else str(v)[:64] for v in row))
+            except sqlite3.Error:
+                pass
+    finally:
+        con.close()
+    return live
+
+def live_strings(db_path):
+    """Printable strings (>=4 chars) that are still in a live row, to subtract from recovered ones."""
+    import re
+    con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    s = set()
+    try:
+        for t in [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]:
+            try:
+                for row in con.execute('SELECT * FROM "%s"' % t):
+                    for v in row:
+                        if isinstance(v, str):
+                            for m in re.findall(r"[\x20-\x7e]{4,}", v): s.add(m)
+            except sqlite3.Error:
+                pass
+    finally:
+        con.close()
+    return s
+
+def carve_strings(db_path):
+    """Recover readable text that sits in free space but is in no live row (deleted content)."""
+    import re
+    with open(db_path, "rb") as f:
+        data = f.read()
+    if data[:16] != b"SQLite format 3\x00":
+        return []
+    page_size = struct.unpack(">H", data[16:18])[0]
+    if page_size == 1: page_size = 65536
+    if page_size == 0 or len(data) % page_size != 0: return []
+    live = live_strings(db_path)
+    found = []; seen = set()
+    for pi in range(len(data) // page_size):
+        page = data[pi*page_size:(pi+1)*page_size]
+        base = 100 if pi == 0 else 0
+        if base >= len(page) or page[base] not in (0x05,0x0d,0x02,0x0a): continue
+        hdr = 12 if page[base] in (0x05,0x02) else 8
+        ncells = struct.unpack(">H", page[base+3:base+5])[0]
+        cell_ptr_end = base + hdr + ncells*2
+        content_start = struct.unpack(">H", page[base+5:base+7])[0] or 65536
+        regions = []
+        if content_start > cell_ptr_end: regions.append((cell_ptr_end, content_start))
+        fb = struct.unpack(">H", page[base+1:base+3])[0]; g=0
+        while fb and g < 4096:
+            if fb+4 > len(page): break
+            nxt = struct.unpack(">H", page[fb:fb+2])[0]; size = struct.unpack(">H", page[fb+2:fb+4])[0]
+            regions.append((fb, min(fb+size, len(page))))
+            if nxt <= fb: break
+            fb = nxt; g += 1
+        for lo, hi in regions:
+            for m in re.findall(rb"[\x20-\x7e]{5,}", page[lo:hi]):
+                txt = m.decode("ascii", "replace")
+                if txt in seen: continue
+                # keep only strings not wholly contained in a live value (i.e. deleted content)
+                if any(txt in lv for lv in live): continue
+                seen.add(txt); found.append((pi, txt))
+    return found
+
+def carve_db(db_path):
+    """Walk every page's free space and recover records not referenced by any table."""
+    with open(db_path, "rb") as f:
+        data = f.read()
+    if data[:16] != b"SQLite format 3\x00":
+        return None
+    page_size = struct.unpack(">H", data[16:18])[0]
+    if page_size == 1: page_size = 65536
+    if page_size == 0 or len(data) % page_size != 0:
+        return None
+    live = live_records(db_path)
+    recovered = []
+    seen = set()
+    npages = len(data) // page_size
+    for pi in range(npages):
+        page = data[pi * page_size: (pi + 1) * page_size]
+        base = 100 if pi == 0 else 0   # page 1 has the 100-byte file header
+        if base >= len(page): continue
+        ptype = page[base]
+        if ptype not in (0x05, 0x0d, 0x02, 0x0a):   # interior/leaf table/index b-tree
+            continue
+        hdr = 12 if ptype in (0x05, 0x02) else 8
+        ncells = struct.unpack(">H", page[base + 3:base + 5])[0]
+        cell_ptr_end = base + hdr + ncells * 2
+        content_start = struct.unpack(">H", page[base + 5:base + 7])[0] or 65536
+        # unallocated region: between the cell pointer array and the first cell content
+        regions = []
+        if content_start > cell_ptr_end:
+            regions.append((cell_ptr_end, content_start))
+        # freeblock chain
+        fb = struct.unpack(">H", page[base + 1:base + 3])[0]
+        guard = 0
+        while fb and guard < 4096:
+            if fb + 4 > len(page): break
+            nxt = struct.unpack(">H", page[fb:fb + 2])[0]
+            size = struct.unpack(">H", page[fb + 2:fb + 4])[0]
+            regions.append((fb + 4, min(fb + size, len(page))))
+            if nxt <= fb: break
+            fb = nxt; guard += 1
+        for (lo, hi) in regions:
+            off = lo
+            while off < hi:
+                vals, tl = try_record(page, off)
+                if vals and tl >= 6:
+                    key = tuple("" if v is None else str(v)[:64] for v in vals)
+                    if key not in live and key not in seen and any(isinstance(v, str) and len(str(v)) >= 3 for v in vals):
+                        seen.add(key)
+                        recovered.append((pi, vals))
+                    off += tl
+                else:
+                    off += 1
+    return recovered
+
+import mmap
+
+# (name, header, footer_or_None, max_bytes). When footer is None the file runs from its header to
+# the next header of any known type, capped at max_bytes.
+RAW_SIGS = [
+    ("jpg",  b"\xff\xd8\xff",            b"\xff\xd9",                 30_000_000),
+    ("png",  b"\x89PNG\r\n\x1a\n",      b"IEND\xae\x42\x60\x82",   50_000_000),
+    ("gif",  b"GIF89a",                     None,                         20_000_000),
+    ("gif",  b"GIF87a",                     None,                         20_000_000),
+    ("pdf",  b"%PDF-",                      b"%%EOF",                     100_000_000),
+    ("sqlite", b"SQLite format 3\x00",      None,                         500_000_000),
+    ("zip",  b"PK\x03\x04",                None,                         200_000_000),
+    ("mp3",  b"ID3",                        None,                         50_000_000),
+]
+# container formats with the signature at a fixed offset inside the file (ISO-BMFF: ....ftyp)
+RAW_FTYP = {
+    b"ftypqt  ": "mov", b"ftypisom": "mp4", b"ftypmp42": "mp4", b"ftypMSNV": "mp4",
+    b"ftypM4V ": "m4v", b"ftypheic": "heic", b"ftypheix": "heic", b"ftypmif1": "heic",
+}
+
+def carve_raw(image_path, out_dir, on_progress=None):
+    """Signature-carve files from a raw whole-partition image, streamed via mmap so a multi-GB image
+    fits in memory. Recovers deleted files whose directory entry is gone but whose blocks remain."""
+    os.makedirs(out_dir, exist_ok=True)
+    counts = {}
+    try:
+        fd = os.open(image_path, os.O_RDONLY)
+    except OSError as e:
+        return {"error": str(e)}
+    try:
+        size = os.fstat(fd).st_size
+        if size == 0:
+            return counts
+        mm = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+    finally:
+        pass
+    try:
+        # collect every known header offset first (for the "next header" bound)
+        all_headers = []
+        for ext, hdr, _ftr, _mx in RAW_SIGS:
+            off = mm.find(hdr, 0)
+            while off != -1:
+                all_headers.append(off); off = mm.find(hdr, off + 1)
+        # ftyp boxes: the tag sits at offset+4; the file starts 4 bytes before (the box size field)
+        off = mm.find(b"ftyp", 0)
+        while off != -1:
+            tag = mm[off:off+8]
+            if tag in RAW_FTYP and off >= 4:
+                all_headers.append(off - 4)
+            off = mm.find(b"ftyp", off + 1)
+        all_headers = sorted(set(all_headers))
+
+        def next_header_after(pos):
+            import bisect
+            i = bisect.bisect_right(all_headers, pos)
+            return all_headers[i] if i < len(all_headers) else size
+
+        def write(ext, start, end):
+            end = min(end, size)
+            if end - start < 100:
+                return
+            n = counts.get(ext, 0)
+            out = os.path.join(out_dir, "%s_%012x.%s" % (ext, start, ext))
+            with open(out, "wb") as w:
+                w.write(mm[start:end])
+            counts[ext] = n + 1
+
+        # carve header/footer types
+        for ext, hdr, ftr, mx in RAW_SIGS:
+            off = mm.find(hdr, 0)
+            while off != -1:
+                if ftr is not None:
+                    end = mm.find(ftr, off + len(hdr))
+                    end = (end + len(ftr)) if (end != -1 and end - off <= mx) else min(off + mx, next_header_after(off))
+                else:
+                    end = min(off + mx, next_header_after(off))
+                write(ext, off, end)
+                if on_progress: on_progress(off, size)
+                off = mm.find(hdr, max(off + 1, end))
+        # carve ftyp container files
+        off = mm.find(b"ftyp", 0)
+        while off != -1:
+            tag = mm[off:off+8]
+            if tag in RAW_FTYP and off >= 4:
+                start = off - 4
+                write(RAW_FTYP[tag], start, min(start + 2_000_000_000, next_header_after(start)))
+            off = mm.find(b"ftyp", off + 1)
+    finally:
+        mm.close(); os.close(fd)
+    return counts
+
+def carve_images(path, out_dir, min_bytes=1500, max_bytes=20_000_000):
+    """Carve whole JPEG/PNG images out of a file by their signatures. Android gallery thumbnail
+    caches (.thumbdata*) and many app blobs concatenate images, including thumbnails of photos the
+    user has since DELETED, so this recovers them with no root. Returns the list of files written."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+    os.makedirs(out_dir, exist_ok=True)
+    found = []
+    n = len(data)
+    i = 0
+    while i < n - 3:
+        # JPEG: FF D8 FF ... FF D9
+        if data[i] == 0xFF and data[i+1] == 0xD8 and data[i+2] == 0xFF:
+            end = data.find(b"\xff\xd9", i + 2)
+            if end != -1:
+                end += 2
+                if min_bytes <= end - i <= max_bytes:
+                    out = os.path.join(out_dir, "carved_%08x.jpg" % i)
+                    with open(out, "wb") as w: w.write(data[i:end])
+                    found.append(out); i = end; continue
+        # PNG: 89 50 4E 47 0D 0A 1A 0A ... IEND
+        if data[i:i+8] == b"\x89PNG\r\n\x1a\n":
+            end = data.find(b"IEND\xae\x42\x60\x82", i)
+            if end != -1:
+                end += 8
+                if min_bytes <= end - i <= max_bytes:
+                    out = os.path.join(out_dir, "carved_%08x.png" % i)
+                    with open(out, "wb") as w: w.write(data[i:end])
+                    found.append(out); i = end; continue
+        i += 1
+    return found
+
+def scan(label, db_paths, out_root, image_sources=None):
+    out = os.path.join(out_root, label); os.makedirs(out, mode=0o700, exist_ok=True)
+    carved_imgs = 0
+    if image_sources:
+        img_out = os.path.join(out, "carved_images")
+        for src in image_sources:
+            carved_imgs += len(carve_images(src, img_out))
+    tmp = tempfile.mkdtemp()
+    total = 0; per_db = []
+    rec_csv = os.path.join(out, "recovered_records.csv")
+    str_csv = os.path.join(out, "recovered_text.csv")
+    sfh = open(str_csv, "w", newline=""); sw = csv.writer(sfh); sw.writerow(["database", "page", "deleted_text"])
+    with open(rec_csv, "w", newline="") as rf:
+        w = csv.writer(rf); w.writerow(["database", "page", "values"])
+        for src in db_paths:
+            try:
+                local = os.path.join(tmp, os.path.basename(src) + "-" + str(len(per_db)))
+                shutil.copy2(src, local)
+                for sc in ("-wal", "-shm"):
+                    if os.path.isfile(src + sc): shutil.copy2(src + sc, local + sc)
+                recs = carve_db(local)
+            except Exception as e:
+                recs = None
+            if recs is None:
+                continue
+            strs = carve_strings(local)
+            if recs or strs:
+                per_db.append((src, len(recs), len(strs)))
+                total += len(recs)
+                for pi, vals in recs:
+                    w.writerow([os.path.basename(src), pi, " | ".join("" if v is None else str(v)[:120] for v in vals)])
+                for pi, txt in strs:
+                    sw.writerow([os.path.basename(src), pi, txt[:300]])
+    sfh.close()
+    str_total = sum(x[2] for x in per_db)
+    shutil.rmtree(tmp, ignore_errors=True)
+    with open(os.path.join(out, "recovery_summary.md"), "w") as f:
+        f.write("# %s deep recovery\n\n" % label)
+        f.write("%d deleted record(s) and %d deleted text fragment(s) carved from %d database(s).\n\n" % (total, str_total, len(per_db)))
+        for src, n, sn in sorted(per_db, key=lambda x: -(x[1]+x[2])):
+            f.write("- %s: %d records, %d text fragments recovered\n" % (os.path.basename(src), n, sn))
+        f.write("\nDeleted rows live in SQLite free space until the database is vacuumed. Recovered "
+                "values are in recovered_records.csv. A recovered record is data that was deleted but "
+                "not yet overwritten; absence here does not prove nothing is recoverable elsewhere.\n")
+    return {"label": label, "recovered": total, "text": str_total, "images": carved_imgs, "databases_with_remnants": len(per_db), "csv": rec_csv}
+
+def find_image_blobs(backup):
+    """Files worth carving images out of: thumbnail caches and extensionless/blob app data."""
+    out = []
+    for dp, _d, files in os.walk(backup):
+        for fn in files:
+            low = fn.lower()
+            if "thumbdata" in low or low.endswith((".thumbnails", ".ithmb")) or "/.thumbnails/" in os.path.join(dp, fn).lower():
+                out.append(os.path.join(dp, fn))
+    return out
+
+def find_dbs(backup):
+    out = []
+    for dp, _d, files in os.walk(backup):
+        for fn in files:
+            p = os.path.join(dp, fn)
+            try:
+                with open(p, "rb") as f:
+                    if f.read(16) == b"SQLite format 3\x00":
+                        out.append(p)
+            except OSError:
+                pass
+    return out
+
+def acquire_ios(udid, work):
+    """Back up a connected iPhone with idevicebackup2, so its SQLite databases can be carved for
+    deleted records. The phone must be unlocked and trusted. Returns the backup directory."""
+    import subprocess, shutil
+    if not shutil.which("idevicebackup2"):
+        return None, "idevicebackup2 is not installed (libimobiledevice). Install it: arx install libimobiledevice usbmuxd"
+    os.makedirs(work, exist_ok=True)
+    args = ["idevicebackup2"]
+    if udid: args += ["-u", udid]
+    args += ["backup", "--full", work]
+    r = subprocess.run(args, capture_output=True, text=True)
+    out = (r.stdout + r.stderr)
+    if "Password protected" in out or "notification_proxy" in out:
+        return None, "unlock the iPhone and keep it unlocked, then retry (iOS blocks the backup while locked)"
+    if "Backup Successful" not in out:
+        last = [l for l in out.splitlines() if l.strip()][-1:] or [""]
+        return None, "iPhone backup did not complete: " + last[0]
+    # the backup lands in <work>/<udid>/
+    subs = [os.path.join(work, d) for d in os.listdir(work) if os.path.isdir(os.path.join(work, d))]
+    return (subs[0] if subs else work), "iPhone backed up"
+
+def acquire_android(serial, work):
+    """Pull the databases and thumbnail caches a recovery can carve. Non-root: accessible SQLite
+    DBs in shared storage + the gallery thumbnail caches (deleted-photo thumbnails). Root: the
+    system databases (SMS, calls, contacts) and app databases too. Returns the pulled directory."""
+    import subprocess
+    def adb(*a, **k):
+        base = ["adb"] + (["-s", serial] if serial else [])
+        return subprocess.run(base + list(a), capture_output=True, text=True, **k)
+    os.makedirs(work, exist_ok=True)
+    rooted = "uid=0" in adb("shell", "su", "-c", "id").stdout
+    # list of device paths to pull
+    paths = []
+    # thumbnail caches (no root)
+    thumbs = adb("shell", "find", "/sdcard", "-iname", ".thumbdata*", "-o", "-ipath", "*/.thumbnails/*").stdout
+    paths += [l.strip() for l in thumbs.splitlines() if l.strip()]
+    # accessible SQLite DBs in shared storage (no root)
+    dbs = adb("shell", "find", "/sdcard", "-type", "f", "(", "-name", "*.db", "-o", "-name", "*.sqlite*", ")").stdout
+    paths += [l.strip() for l in dbs.splitlines() if l.strip()]
+    if rooted:
+        # copy the system + app databases to a pullable staging dir, then pull
+        stage = "/sdcard/droidB-recover-stage"
+        adb("shell", "su", "-c",
+            "rm -rf %s; mkdir -p %s; "
+            "for d in /data/data/*/databases /data/user/0/*/databases "
+            "/data/data/com.android.providers.telephony/databases "
+            "/data/data/com.android.providers.contacts/databases; do "
+            "[ -d \"$d\" ] && cp -r \"$d\" %s/$(echo \"$d\" | tr / _) 2>/dev/null; done; "
+            "chmod -R a+r %s" % (stage, stage, stage, stage))
+        paths.append(stage)
+    pulled = os.path.join(work, "pulled"); os.makedirs(pulled, exist_ok=True)
+    for pth in paths:
+        if not pth: continue
+        safe = pth.strip("/").replace("/", "_")
+        adb("pull", pth, os.path.join(pulled, safe))
+    if rooted:
+        adb("shell", "su", "-c", "rm -rf /sdcard/droidB-recover-stage")
+    return pulled, rooted
+
+def image_android_partition(serial, dest_img, partition="userdata", on_progress=None):
+    """dd a device partition to a local raw image over adb, needs root (Magisk). Returns (ok, msg).
+    Uses exec-out so the binary stream is not mangled, and streams in chunks so a huge partition
+    does not need device-side storage. Read-only on the device."""
+    import subprocess
+    base = ["adb"] + (["-s", serial] if serial else [])
+    rooted = "uid=0" in subprocess.run(base + ["shell", "su", "-c", "id"], capture_output=True, text=True).stdout
+    if not rooted:
+        return False, ("this phone is not rooted. Imaging the whole filesystem needs root (Magisk: "
+                       "unlock the bootloader and patch boot.img - droidB can help with that). Without "
+                       "root, use the backup-level recovery and thumbnail carving instead.")
+    # resolve the partition block device
+    block = ""
+    for cand in ("/dev/block/by-name/%s" % partition, "/dev/block/bootdevice/by-name/%s" % partition,
+                 "/dev/block/mapper/%s" % partition):
+        r = subprocess.run(base + ["shell", "su", "-c", "readlink -f %s 2>/dev/null" % cand],
+                           capture_output=True, text=True)
+        b = r.stdout.strip()
+        if b:
+            block = b; break
+    if not block:
+        return False, "could not find the %s partition block device" % partition
+    # stream dd to the local image
+    proc = subprocess.Popen(base + ["exec-out", "su", "-c", "dd if=%s bs=4M 2>/dev/null" % block],
+                            stdout=subprocess.PIPE)
+    written = 0
+    with open(dest_img, "wb") as f:
+        while True:
+            chunk = proc.stdout.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk); written += len(chunk)
+            if on_progress: on_progress(written)
+    proc.wait()
+    if written == 0:
+        return False, "imaging produced no data (block not readable even as root?)"
+    return True, "imaged %.2f GB from %s" % (written / 1e9, block)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--backup"); ap.add_argument("--db"); ap.add_argument("--out", required=True)
+    ap.add_argument("--label", default="device")
+    ap.add_argument("--images", action="store_true", help="also carve JPEG/PNG images (thumbnail caches, blobs)")
+    ap.add_argument("--raw", metavar="IMAGE", help="signature-carve files from a raw partition image")
+    ap.add_argument("--android-raw", nargs="?", const="", default=None, metavar="SERIAL",
+                    help="image a rooted Android's userdata partition, then carve it (whole-filesystem recovery)")
+    ap.add_argument("--android", nargs="?", const="", default=None, metavar="SERIAL",
+                    help="pull databases + thumbnail caches from a connected Android device, then recover")
+    ap.add_argument("--ios", nargs="?", const="", default=None, metavar="UDID",
+                    help="back up a connected iPhone, then recover deleted records from its databases")
+    a = ap.parse_args()
+    out_root = os.path.realpath(os.path.expanduser(a.out)); os.makedirs(out_root, mode=0o700, exist_ok=True)
+    if a.android_raw is not None:
+        out = os.path.join(out_root, a.label); os.makedirs(out, mode=0o700, exist_ok=True)
+        dest = os.path.join(out, "userdata.img")
+        print("imaging the phone's userdata partition (needs root; this is large and slow)...")
+        ok, msg = image_android_partition(a.android_raw or None, dest,
+                                          on_progress=lambda w: None)
+        print("  " + msg)
+        if not ok:
+            sys.exit(1)
+        a.raw = dest
+    if a.raw:
+        out = os.path.join(out_root, a.label); os.makedirs(out, mode=0o700, exist_ok=True)
+        cdir = os.path.join(out, "carved_files")
+        counts = carve_raw(a.raw, cdir)
+        if "error" in counts:
+            print("raw carve failed:", counts["error"]); sys.exit(1)
+        total = sum(counts.values())
+        print("raw carve: %d file(s) recovered -> %s" % (total, cdir))
+        for ext, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            print("  %-6s %d" % (ext, n))
+        with open(os.path.join(out, "raw_carve_summary.md"), "w") as f:
+            f.write("# %s raw carve\n\n%d file(s) from %s\n\n" % (a.label, total, a.raw))
+            for ext, n in sorted(counts.items(), key=lambda kv: -kv[1]): f.write("- %s: %d\n" % (ext, n))
+        sys.exit(0)
+    imgs = None
+    acq_dir = None
+    if a.ios is not None:
+        import tempfile
+        acq_dir = tempfile.mkdtemp(prefix="droidB-ios-")
+        bk, msg = acquire_ios(a.ios or None, acq_dir)
+        print("iPhone: " + msg)
+        if not bk:
+            import shutil; shutil.rmtree(acq_dir, ignore_errors=True); sys.exit(1)
+        a.backup = bk
+    if a.android is not None:
+        import tempfile
+        acq_dir = tempfile.mkdtemp(prefix="droidB-android-")
+        pulled, rooted = acquire_android(a.android or None, acq_dir)
+        print("acquired from Android (%s): %s" % ("rooted - system DBs included" if rooted else "no root - shared storage + thumbnails", pulled))
+        a.backup = pulled; a.images = True
+    if a.db:
+        dbs = [a.db]; imgs = [a.db] if a.images else None
+    elif a.backup:
+        dbs = find_dbs(a.backup); imgs = (find_image_blobs(a.backup) + dbs) if a.images else None
+    else:
+        print("give --backup, --db or --android"); sys.exit(2)
+    r = scan(a.label, dbs, out_root, image_sources=imgs)
+    if acq_dir:
+        import shutil; shutil.rmtree(acq_dir, ignore_errors=True)
+    print("deep recovery: %d deleted record(s) + %d deleted text fragment(s)%s from %d database(s) with remnants (of %d scanned) -> %s" % (
+        r["recovered"], r["text"],
+        (" + %d carved image(s)" % r["images"]) if a.images else "",
+        r["databases_with_remnants"], len(dbs), os.path.dirname(r["csv"])))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,39 @@
+# droidB — Android device access for the plugdev group, so droidB needs no root to talk to a phone.
+# Covers ADB, fastboot, download/EDL/BROM modes, and MTP/PTP (so a debugging-off phone is still
+# accessible for detection). One rule per OEM USB vendor ID. GROUP=plugdev, MODE=0660.
+#
+# Install: /etc/udev/rules.d/51-droidB-android.rules , then `udevadm control --reload && udevadm trigger`.
+# Add yourself to plugdev: `usermod -aG plugdev $USER` (re-login to take effect).
+
+# Google / Nexus / Pixel
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# Samsung
+SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# Xiaomi
+SUBSYSTEM=="usb", ATTR{idVendor}=="2717", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# HTC
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bb4", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# Huawei
+SUBSYSTEM=="usb", ATTR{idVendor}=="12d1", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# OnePlus / Oppo / Realme (BBK)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2a70", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="22d9", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# Motorola / Lenovo
+SUBSYSTEM=="usb", ATTR{idVendor}=="22b8", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="17ef", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# Sony
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fce", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# LG
+SUBSYSTEM=="usb", ATTR{idVendor}=="1004", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# Asus
+SUBSYSTEM=="usb", ATTR{idVendor}=="0b05", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# ZTE / Nubia
+SUBSYSTEM=="usb", ATTR{idVendor}=="19d2", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# Nothing
+SUBSYSTEM=="usb", ATTR{idVendor}=="2916", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# Fairphone / Google-AOSP fastboot fallback vendor
+SUBSYSTEM=="usb", ATTR{idVendor}=="2ae5", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# Qualcomm EDL (9008) — recovery flashing
+SUBSYSTEM=="usb", ATTR{idVendor}=="05c6", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# MediaTek BROM/preloader
+SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", MODE="0660", GROUP="plugdev", TAG+="uaccess"

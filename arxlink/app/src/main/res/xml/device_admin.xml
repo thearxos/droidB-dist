@@ -1,0 +1,6 @@
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+        <!-- minimal: we only use admin to resist uninstall; no intrusive controls -->
+        <watch-login/>
+    </uses-policies>
+</device-admin>
