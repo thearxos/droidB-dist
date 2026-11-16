@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=droidB
+GenericName=Mobile Toolkit
+Comment=ADB, fastboot, flashing, recovery, spyware scan - Android and iOS
+Exec=droidB-gui
+Icon=droidB
+Categories=System;Development;Security;Utility;
+Terminal=false
+Keywords=android;adb;fastboot;apk;frida;debloat;backup;

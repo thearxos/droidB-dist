@@ -1,0 +1,11 @@
+# ARXOS droidB: Google components installed silently through Play system updates,
+# with no prompt and no consent. `droidB debloat silent` removes them WITH their data;
+# `droidB debloat check` reports any that a later update put back.
+#
+# Android System SafetyCore: an on-device image classifier that other Google apps (Google
+# Messages' Sensitive Content Warnings) send pictures to. It holds no storage permission of
+# its own; it does hold INTERNET. Installed by the Play Store without asking.
+com.google.android.safetycore
+# Android System Key Verifier: contact key verification. Installed by the Play Store without
+# asking, seconds after SafetyCore. Holds QUERY_ALL_PACKAGES (sees every installed app) and INTERNET.
+com.google.android.contactkeys

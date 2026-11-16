@@ -1,0 +1,47 @@
+# ARXOS droidB: mtkclient without the Keystone assembler.
+#
+# mtkclient's commands (mtk, mtk_gui, stage2, da_parser, brom_to_offs) never call Keystone: its only
+# users are a standalone assembler module nothing imports and a guarded import whose function nothing
+# calls. Keystone 0.9.2, the last release, carries CVE-2020-36404 and CVE-2020-36405, fixed only in
+# unreleased upstream code. So this package drops the dependency and the dead module, and replaces
+# the community mtkclient package (same commands, same upstream commit).
+pkgname=mtkclient-arxos
+_commit=5a863eece86fcaa97cb8325cf747e0aae3c307e4
+pkgver=2.1.4.1
+pkgrel=1
+pkgdesc="MediaTek flash and recovery tool (mtkclient) for droidB, without the Keystone assembler"
+url="https://github.com/bkerler/mtkclient"
+license=('GPL-3.0-only')
+arch=('any')
+provides=("mtkclient=$pkgver")
+conflicts=('mtkclient')
+depends=('pyside6' 'python' 'python-capstone' 'python-colorama' 'python-fusepy' 'python-pycryptodomex' 'python-pyserial' 'python-pyusb')
+makedepends=('git' 'python-build' 'python-hatchling' 'python-installer' 'python-wheel')
+optdepends=('android-udev: ADB/Fastboot support')
+source=("mtkclient::git+$url.git#commit=$_commit")
+sha256sums=('SKIP')
+
+prepare() {
+  cd mtkclient
+  # udev: the active seat's user gets the device, not a plugdev group
+  local r='s&MODE=\S+&MODE="0660",&g;s&GROUP="plugdev"&TAG+="uaccess"&g;'
+  sed -E -e "$r" -i Setup/Linux/51-edl.rules Setup/Linux/52-mtk.rules
+  # no Keystone: the dead assembler module goes, and the package metadata stops asking for it
+  rm -f mtkclient/Library/asmtools.py
+  sed -i '/keystone/Id' pyproject.toml
+  ! grep -rIl --include='*.py' -E '^\s*(from|import)\s+keystone' mtkclient \
+    | xargs -r grep -L 'except ImportError' | grep . \
+    || { echo "an unguarded Keystone import is left" >&2; return 1; }
+}
+
+build() {
+  cd mtkclient
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd mtkclient
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 Setup/Linux/51-edl.rules "$pkgdir"/usr/lib/udev/rules.d/51-mtkclient-edl.rules
+  install -Dm644 Setup/Linux/52-mtk.rules "$pkgdir"/usr/lib/udev/rules.d/52-mtkclient-mtk.rules
+}

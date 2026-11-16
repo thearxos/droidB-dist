@@ -1,0 +1,19 @@
+[Unit]
+Description=droidB link keeper (reconnect saved wireless devices over LAN/WAN)
+After=network-online.target
+Wants=network-online.target
+# Enabled for every account's user manager, so it would also start for system accounts such as the
+# login screen's (lightdm): an adb server there is shared by everyone who signs in after it and
+# holds that account's key. Phones belong to people, so only people's accounts run it.
+ConditionUser=!@system
+
+[Service]
+Type=simple
+# reconnects are by address: adb's network discovery stays off (see droidB-link)
+Environment=ADB_MDNS=0
+ExecStart=/usr/local/bin/droidB-link --interval 30
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# droidB: with no arguments, the droidB window; with arguments, the droidB engine's commands
+# (droidB audit, droidB vulns, droidB harden verify, droidB debloat check, droidB mvt scan, ...).
+case "${1:-}" in
+  ""|gui|--gui) exec droidB-gui ;;
+  *) exec droidB-native "$@" ;;
+esac

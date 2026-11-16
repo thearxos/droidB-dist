@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# droidB-adb 0.0.1 - make droidB work WITH or WITHOUT USB debugging.
+#
+# It detects whatever access the device currently offers (normal adb / recovery adb / sideload /
+# fastboot / download / raw USB) and can OVERRIDE - actually turn USB debugging ON - on a device
+# that shipped with it off, using a debugging-independent way in: a recovery adb shell (e.g. TWRP)
+# or an already-rooted shell.
+#
+# The override (run from a recovery or root shell) does three things, then you reboot:
+#   1. trusts THIS pc      - injects the adb public key into /data/misc/adb/adb_keys (no on-screen prompt)
+#   2. flips the switch     - sets adb_enabled=1 in Settings.Global (settings_global.xml)
+#   3. brings up the iface  - sets persist.sys.usb.config to include adb
+#
+# HONEST LIMIT: a fully locked device with only stock recovery AND debugging off cannot be
+# overridden - that is Android's security boundary, not a droidB gap. droidB says so and points
+# you at the paths that DO work (fastboot / download-mode flashing, recovery sideload).
+#
+# Usage:
+#   droidB-adb access                 get in (enable debugging if needed) and open full control
+#   droidB-adb control                mirror + drive the screen from the PC (dead-display savior)
+#   droidB-adb detect                 show the current access path
+#   droidB-adb enable-debug           override: turn USB debugging on (needs recovery/root adb)
+#   droidB-adb authorize              trust this pc only (inject the adb key)
+#   droidB-adb shell [cmd...]         shell over whatever adb path is live (normal or recovery)
+set -u
+GR=$'\033[1;32m'; RD=$'\033[1;31m'; YL=$'\033[1;33m'; DM=$'\033[90m'; AC=$'\033[38;5;208m'; BD=$'\033[1m'; RS=$'\033[0m'
+say(){ printf "  ${GR}>>${RS} %s\n" "$*"; }
+err(){ printf "  ${RD}xx${RS} %s\n" "$*"; }
+warn(){ printf "  ${YL}!!${RS} %s\n" "$*"; }
+inf(){ printf "  ${DM}.. %s${RS}\n" "$*"; }
+
+command -v adb >/dev/null 2>&1 || { err "adb not found (arx install android-tools)"; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+# ---- access-path detection (works even with debugging off) ------------------
+access_path(){
+  local st; st=$(adb get-state 2>/dev/null || echo "")
+  case "$st" in
+    device)   echo "adb";      return;;
+    recovery) echo "recovery"; return;;
+    sideload) echo "sideload"; return;;
+  esac
+  local fb; fb=$(fastboot devices 2>/dev/null)
+  [ -n "$fb" ] && { echo "fastboot"; return; }
+  if have odin4 && odin4 -l 2>/dev/null | grep -q "/dev/"; then echo "download"; return; fi
+  if have heimdall && heimdall detect 2>&1 | grep -qi "detected"; then echo "download"; return; fi
+  # raw USB enumeration - readable with zero authorization
+  local vid
+  for d in /sys/bus/usb/devices/*/; do
+    vid=$(cat "$d/idVendor" 2>/dev/null) || continue
+    case "$vid" in 04e8|18d1|22b8|2717|22d9|2a70|12d1|0bb4|1004|19d2|0fce|2a45|05c6|0e8d|0489|2916|1bbb) echo "usb"; return;; esac
+  done
+  echo "none"
+}
+
+detect(){
+  local p; p=$(access_path)
+  case "$p" in
+    adb)      say "access: ${AC}normal adb${RS} - USB debugging is ON. Full control available.";;
+    recovery) say "access: ${AC}recovery adb${RS} - no debugging toggle needed. Override + shell + backup available.";;
+    sideload) say "access: ${AC}adb sideload${RS} - flash an OTA/ROM zip.";;
+    fastboot) say "access: ${AC}fastboot${RS} - bootloader. Flash/boot/unlock. Boot a recovery to enable debugging.";;
+    download) say "access: ${AC}download mode${RS} (Samsung) - flash firmware with droidB-samsung.";;
+    usb)      say "access: ${AC}raw USB${RS} - device seen but no adb/fastboot. Boot recovery to enable debugging.";;
+    none)     err "no device detected on any interface.";;
+  esac
+  [ "$p" = none ] && return 1 || return 0
+}
+
+# ---- adb key injection (trust this pc) --------------------------------------
+inject_key(){
+  local key="$HOME/.android/adbkey" pub="$HOME/.android/adbkey.pub"
+  adb start-server >/dev/null 2>&1
+  [ -f "$pub" ] || adb keygen "$key" >/dev/null 2>&1 || true
+  [ -f "$pub" ] || { err "no adb public key and none could be generated"; return 1; }
+  adb shell "mount /data 2>/dev/null; mount -o remount,rw /data 2>/dev/null" >/dev/null 2>&1
+  if adb push "$pub" /data/misc/adb/adb_keys >/dev/null 2>&1 \
+     || adb shell "mkdir -p /data/misc/adb && cat > /data/misc/adb/adb_keys" < "$pub" >/dev/null 2>&1; then
+    adb shell "chmod 640 /data/misc/adb/adb_keys; chown system:shell /data/misc/adb/adb_keys; restorecon /data/misc/adb/adb_keys" >/dev/null 2>&1
+    say "adb key installed - this pc is trusted (no on-screen prompt)"
+    return 0
+  fi
+  err "could not write /data/misc/adb/adb_keys (need root or a recovery adb shell with /data mounted)"; return 1
+}
+
+# ---- THE OVERRIDE: enable USB debugging -------------------------------------
+enable_debug(){
+  local p; p=$(access_path)
+  if [ "$p" = adb ]; then
+    # already reachable; make sure it is enabled + trusted, and persistent
+    inf "adb already works - ensuring debugging stays on + trusting this pc"
+    adb shell "su -c 'settings put global adb_enabled 1' 2>/dev/null" >/dev/null 2>&1 || true
+    inject_key; return 0
+  fi
+  if [ "$p" != recovery ]; then
+    err "cannot enable USB debugging from '$p'."
+    case "$p" in
+      fastboot) warn "you are in fastboot: boot a recovery to get a shell, e.g.  fastboot boot twrp.img  then re-run.";;
+      download) warn "you are in Samsung download mode: use droidB-samsung to flash; download mode can't toggle debugging.";;
+      usb|none) warn "boot into recovery (Vol keys) to get a debugging-independent shell, then re-run.";;
+    esac
+    warn "a fully locked device with only stock recovery and debugging off cannot be overridden (Android security)."
+    return 1
+  fi
+
+  say "recovery shell present - enabling USB debugging"
+  adb shell "mount /data 2>/dev/null; mount -o remount,rw /data 2>/dev/null" >/dev/null 2>&1
+  # 1. trust this pc
+  inject_key || warn "key injection failed - you may still get the on-screen prompt after reboot"
+  # 2. flip adb_enabled=1 in Settings.Global (edit if present, else insert before </settings>)
+  local out
+  out=$(adb shell '
+    F=/data/system/users/0/settings_global.xml
+    [ -f "$F" ] || F=/data/system/users/0/settings_secure.xml
+    if [ ! -f "$F" ]; then echo "NOFILE"; exit 0; fi
+    if grep -q "name=\"adb_enabled\"" "$F"; then
+      sed -i "s#\(name=\"adb_enabled\" value=\)\"[^\"]*\"#\1\"1\"#" "$F" && echo "UPDATED $F"
+    else
+      sed -i "s#</settings>#  <setting id=\"90001\" name=\"adb_enabled\" value=\"1\" package=\"android\" defaultValue=\"1\" defaultSysSet=\"true\" />\n</settings>#" "$F" && echo "INSERTED $F"
+    fi
+    chown 1000:1000 "$F" 2>/dev/null; chmod 600 "$F" 2>/dev/null
+  ' 2>/dev/null | tr -d '\r')
+  case "$out" in
+    UPDATED*|INSERTED*) say "adb_enabled=1 written (${out#* })";;
+    NOFILE) warn "no settings file found - /data may be encrypted (FBE). Decrypt in recovery, or set debugging on first boot.";;
+    *)      warn "could not confirm the settings edit ($out) - try a full custom recovery (TWRP) with /data decrypted.";;
+  esac
+  # 3. bring the adb interface up on next boot
+  adb shell 'setprop persist.sys.usb.config adb 2>/dev/null; setprop sys.usb.config adb 2>/dev/null' >/dev/null 2>&1
+  printf "\n"; say "done. reboot the device: it boots with USB debugging ON and this pc trusted."
+  say "then:  droidB-adb reboot   and once it is up  droidB-adb control   for full screen access"
+}
+
+# see + drive the device from the PC. Works for a dead DISPLAY (mirror to the PC, turn the phone
+# panel off, keep it awake) and a dead TOUCH (drive with the PC mouse/keyboard) - a normal-feeling
+# experience. This is the payoff of getting access: you use the phone like any screen user would.
+control(){
+  command -v scrcpy >/dev/null 2>&1 || { err "scrcpy not installed (arx install scrcpy)"; return 1; }
+  local p; p=$(access_path)
+  { [ "$p" = adb ] || [ "$p" = recovery ]; } || { err "no adb access yet - run:  droidB-adb enable-debug"; return 1; }
+  say "opening the device on your PC (mouse + keyboard; the phone's own panel stays off)"
+  scrcpy --stay-awake --turn-screen-off --show-touches
+}
+
+# one shot: get in (with or WITHOUT USB debugging) and hand you the screen - the whole point.
+access(){
+  local p; p=$(access_path)
+  case "$p" in
+    adb)      say "USB debugging is on - opening full control"; control ;;
+    recovery) enable_debug; printf "\n"; say "after the reboot:  droidB-adb control   (full screen access, like a normal user)" ;;
+    *)        detect; err "get the device into recovery or normal adb first, then re-run:  droidB-adb access" ;;
+  esac
+}
+
+# Forgot/scrambled the PIN and locked out? Honest recovery paths. On modern Android /data is
+# encrypted with a key derived from the PIN (FBE + hardware Gatekeeper), so USB debugging CANNOT
+# be enabled and data CANNOT be read without it - the same wall that protects the phone from a
+# thief. There is no legitimate lock/FRP bypass; these are the real options.
+recover(){
+  say "locked out (forgot / changed the PIN)? honest options, best first:"
+  printf "\n"
+  printf "  ${BD}1. Keep your data - remote unlock (needs the account)${RS}\n"
+  printf "     Samsung: ${AC}findmymobile.samsung.com${RS} -> Unlock  (needs the Samsung account that was\n"
+  printf "              signed in + Remote unlock on). Removes the lock, KEEPS data. The only keep-data path.\n"
+  printf "     Google:  Find My Device can lock/erase but NOT unlock (Google removed that).\n"
+  printf "\n"
+  printf "  ${BD}2. Factory reset - regains a usable device, ERASES all data${RS}\n"
+  printf "     Samsung download mode: full firmware flash with CSC + USERDATA (wipes /data):\n"
+  printf "              ${AC}droidB-samsung${RS}   (do NOT pass --preserve-data)\n"
+  printf "     Others:  stock recovery -> 'Wipe data / factory reset'.\n"
+  printf "\n"
+  printf "  ${BD}3. Bootloader already unlocked? clean reset, no FRP${RS}\n"
+  printf "     If YOU unlocked the bootloader beforehand (OEM unlocking, done while you had access),\n"
+  printf "     a fastboot wipe re-flashes freely and skips FRP on most devices:  fastboot -w  +  flash.\n"
+  printf "     (You cannot unlock a bootloader while locked out - it lives behind the lock screen. This\n"
+  printf "      is a PREPARE-AHEAD option, not an after-the-fact one.)\n"
+  printf "\n"
+  printf "  ${BD}4. After a locked reset: FRP${RS}\n"
+  printf "     It will ask for the Google/Samsung account that was on the device. Sign in with YOUR\n"
+  printf "     account to finish. There is no legitimate bypass - that is what stops stolen phones.\n"
+  printf "\n"
+  warn "'USB debug regardless' is impossible on a locked, encrypted device: no PIN = no /data key ="
+  warn "no debugging and no data. Hardware Gatekeeper/Weaver seals the key - the account login IS the"
+  warn "owner's emergency way back in. That same wall is what protects your data if the phone is stolen."
+  printf "\n"
+  say "PREPARE AHEAD so a lockout is never catastrophic:"
+  say "  · run 'droidB-rescue' before you change a PIN or flash - backs up contacts/media/apps first"
+  say "  · keep Samsung Find My Mobile / Google account signed in + Remote unlock ON (data-safe recovery)"
+  say "  · optionally unlock the bootloader on a device you control (accepts a wipe, gains clean reset)"
+}
+
+case "${1:-access}" in
+  access)        access;;
+  control)       control;;
+  detect)        detect;;
+  recover)       recover;;
+  authorize)     inject_key;;
+  enable-debug)  enable_debug;;
+  reboot)        adb reboot 2>/dev/null || true;;
+  shell)         shift; adb shell "$@";;
+  *) err "usage: droidB-adb access | control | recover | detect | enable-debug | authorize | shell [cmd...] | reboot"; exit 1;;
+esac

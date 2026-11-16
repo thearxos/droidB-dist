@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ArxOS Link: headless, unremovable (Device Admin), battery-exempt tunnel + ADB keeper.
+     NO <activity> with a LAUNCHER intent-filter, so there is no app-drawer icon (Play-Services-style);
+     it is visible only in Settings > Apps, so the kid cannot find it to delete while clearing space. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.arxos.link" android:versionCode="1" android:versionName="0.1.0">
+
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34"/>
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <!-- granted once over adb (no root): re-enables wireless debugging on boot -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"/>
+    <!-- the embedded tunnel runs as a VpnService (Tailscale/WireGuard client) -->
+    <uses-permission android:name="android.permission.BIND_VPN_SERVICE"/>
+
+    <application android:label="ArxOS Link" android:allowBackup="false"
+        android:hasCode="true" android:icon="@null">
+
+        <!-- Device Admin: active admin cannot be uninstalled until admin is disabled in
+             Settings > Security, which the kid does not reach from the app drawer. -->
+        <receiver android:name=".AdminReceiver" android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data android:name="android.app.device_admin"
+                android:resource="@xml/device_admin"/>
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- relaunch after a reboot (START_STICKY service also self-restarts) -->
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- the forever-running service: keeps the tunnel up and re-enables adb-over-wifi.
+             foreground + START_STICKY so battery optimization and the OS do not kill it. -->
+        <service android:name=".LinkService" android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the home device reachable over an encrypted tunnel"/>
+        </service>
+
+        <!-- the embedded tunnel (Tailscale/WireGuard client) as an Android VpnService -->
+        <service android:name=".TunnelVpnService" android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse">
+            <intent-filter><action android:name="android.net.VpnService"/></intent-filter>
+        </service>
+
+        <!-- a settings-only entry (NO LAUNCHER filter) used during the one-time setup to log in /
+             confirm; the kid cannot reach it from the home screen. -->
+        <activity android:name=".SetupActivity" android:exported="false"
+            android:excludeFromRecents="true" android:taskAffinity=""/>
+    </application>
+</manifest>

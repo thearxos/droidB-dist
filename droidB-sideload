@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""droidB-sideload: install Android apps and their game data from files you already have.
+
+Accepts APK, XAPK, APKS, APKM, ZIP and 7z bundles (split APK sets installed together), and OBB
+expansion files (raw, inside the bundle, or in their own ZIP/7z). Every file is hashed and checked
+against a checksum file beside it when one exists; a mismatch always stops. Package, version, SDK
+and ABI are read from the APKs and checked against the phone before anything is installed. OBB
+files keep their names and go to /sdcard/Android/obb/<package>/, size-checked after the push.
+Retries that change Android's normal rules (a version downgrade, an old target SDK) and pushing an
+OBB whose name does not match the app happen only with consent.
+
+    droidB-sideload inspect  [--json] FILE
+    droidB-sideload install  [--json] [--serial S] [--obb FILE]... [--allow-downgrade]
+                             [--allow-old-target] [--allow-obb-mismatch] FILE
+    droidB-sideload push-obb [--json] [--serial S] [--package P] [--allow-obb-mismatch] FILE
+    droidB-sideload scan     [--json] DIR
+    droidB-sideload info     [--json] [--serial S]
+
+With --json the result is one JSON object on stdout and nothing is asked. When consent is needed
+the exit status is 3 and "need" names it (downgrade, old_target, obb_mismatch, device); run again
+with the matching --allow-... flag (or --serial) to go ahead. Exit 0 = done, 1 = failed, 2 = usage.
+"""
+import argparse, hashlib, json, os, re, shlex, shutil, subprocess, sys, tempfile, zipfile
+
+VERSION = "0.4.21"
+PKG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
+OBB_RE = re.compile(r"^(main|patch)\.(\d+)\.([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)\.obb$")
+SIDECARS = (".sha256", ".sha256sum", ".sha256.txt")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "droidB", "sideload")
+NEED_EXIT = 3
+FAILURES = {
+    "INSTALL_FAILED_UPDATE_INCOMPATIBLE": "The app on the phone is signed by someone else. Android only replaces an app with one from the same signer: uninstall the old app first (its data is lost) or use the matching build.",
+    "INSTALL_FAILED_NO_MATCHING_ABIS": "This build has no native code for this phone's processor.",
+    "INSTALL_FAILED_OLDER_SDK": "The app needs a newer Android version than this phone has.",
+    "INSTALL_FAILED_INSUFFICIENT_STORAGE": "The phone does not have enough free storage.",
+    "INSTALL_FAILED_MISSING_SPLIT": "A required part of the split APK set is missing from the bundle.",
+    "INSTALL_FAILED_INVALID_APK": "Android rejected the APK as invalid or damaged.",
+    "INSTALL_PARSE_FAILED_NO_CERTIFICATES": "The APK is not signed, so Android will not install it.",
+    "INSTALL_FAILED_USER_RESTRICTED": "The phone refused the install: confirm it on the phone, or allow installs over USB in Developer options.",
+    "INSTALL_FAILED_VERIFICATION_FAILURE": "The phone's app verification refused the install.",
+    "INSTALL_FAILED_ABORTED": "The install was cancelled on the phone.",
+}
+
+
+class Stop(Exception):
+    """A result that ends the operation: an error, or a consent the caller must give first."""
+    def __init__(self, message, need=None, **extra):
+        super().__init__(message)
+        self.need, self.extra = need, extra
+
+
+# ---- input files -------------------------------------------------------------------------------
+
+def norm_path(raw):
+    """Paths pasted from a terminal or file manager: outer quotes and ~ are fine."""
+    s = (raw or "").strip().rstrip("\r")
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        s = s[1:-1]
+    if s.startswith("file://"):
+        s = s[len("file://"):]
+    return os.path.abspath(os.path.expanduser(s)) if s else ""
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def checksum(path, digest):
+    """Compare with a checksum file beside the input (file.apk.sha256, file.sha256, ...)."""
+    stem = os.path.splitext(path)[0]
+    for cand in [path + s for s in SIDECARS] + [stem + s for s in SIDECARS]:
+        if not os.path.isfile(cand):
+            continue
+        try:
+            with open(cand, "r", errors="replace") as f:
+                m = re.search(r"\b[0-9a-fA-F]{64}\b", f.read(65536))
+        except OSError:
+            continue
+        if m:
+            want = m.group(0).lower()
+            return {"state": "match" if want == digest else "mismatch", "sidecar": os.path.basename(cand), "expected": want}
+    return {"state": "none", "sidecar": None, "expected": None}
+
+
+def magic(path):
+    with open(path, "rb") as f:
+        return f.read(8)
+
+
+def safe_member(name):
+    """An archive member is extracted only when its path stays inside the target folder."""
+    n = name.replace("\\", "/")
+    if not n or "\x00" in n or n.startswith("/") or re.match(r"^[A-Za-z]:", n):
+        return False
+    return ".." not in n.split("/")
+
+
+def zip_members(path):
+    try:
+        with zipfile.ZipFile(path) as z:
+            return [(i.filename, i.file_size, bool(i.flag_bits & 0x1), (i.external_attr >> 28) == 0xA) for i in z.infolist() if not i.is_dir()]
+    except (zipfile.BadZipFile, OSError) as e:
+        raise Stop("The archive cannot be read: %s" % e)
+
+
+def sevenzip():
+    return shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+
+
+def sevenzip_members(path):
+    tool = sevenzip()
+    if not tool:
+        raise Stop("This is a 7z archive. Install 7-Zip (arx install 7zip) to open it.")
+    out = subprocess.run([tool, "l", "-slt", "-ba", "--", path], capture_output=True, text=True)
+    if out.returncode:
+        raise Stop("The 7z archive cannot be read.")
+    members, cur = [], {}
+    for line in out.stdout.splitlines() + [""]:
+        if not line.strip():
+            if cur.get("Path") and "D" not in cur.get("Attributes", "")[:1] and cur.get("Folder") != "+":
+                mode = cur.get("Attributes", "").split(" ")[-1]          # e.g. "A -rw-r--r--"; a link is "lrwx..."
+                members.append((cur["Path"], int(cur.get("Size") or 0), cur.get("Encrypted") == "+", mode.startswith("l")))
+            cur = {}
+            continue
+        k, _, v = line.partition(" = ")
+        cur[k.strip()] = v
+    return members
+
+
+def classify(path):
+    """What a file is, by content first: apk, bundle, obb, aab or unknown."""
+    if not os.path.isfile(path):
+        raise Stop("No such file: %s" % path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".obb":
+        return "obb", []
+    head = magic(path)
+    if head.startswith(b"7z\xbc\xaf\x27\x1c"):
+        members = sevenzip_members(path)
+    elif head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06"):
+        members = zip_members(path)
+    else:
+        return "unknown", []
+    names = {m[0].replace("\\", "/") for m in members}
+    if "BundleConfig.pb" in names or "base/manifest/AndroidManifest.xml" in names:
+        return "aab", members
+    if "AndroidManifest.xml" in names and head.startswith(b"PK"):
+        return "apk", members
+    if any(n.lower().endswith((".apk", ".obb")) for n in names):
+        return "bundle", members
+    return "unknown", members
+
+
+def extract(path, members, want, dest):
+    """Extract the wanted members (by lowercase suffix) into dest, flat, keeping file names.
+    Refuses unsafe paths, links, encrypted entries and archives larger than the free space."""
+    chosen = [m for m in members if m[0].lower().endswith(want)]
+    seven = not magic(path).startswith(b"PK")
+    for name, _, encrypted, link in chosen:
+        if not safe_member(name) or (seven and any(c in name for c in "*?[]")):
+            raise Stop("Refused: the archive has an unsafe path (%s)." % name)
+        if link:
+            raise Stop("Refused: the archive contains a link (%s)." % name)
+        if encrypted:
+            raise Stop("This archive is password-protected; droidB cannot open it.")
+    need = sum(m[1] for m in chosen)
+    free = shutil.disk_usage(dest).free
+    if need + (64 << 20) > free:
+        raise Stop("Not enough free space to unpack (%d MB needed, %d MB free)." % (need >> 20, free >> 20))
+    out, used = [], set()
+    if magic(path).startswith(b"PK"):
+        with zipfile.ZipFile(path) as z:
+            for name, _, _, _ in chosen:
+                base = os.path.basename(name.replace("\\", "/"))
+                target = unique(dest, base, used)
+                with z.open(name) as src, open(target, "xb") as dst:   # zipfile checks each CRC
+                    shutil.copyfileobj(src, dst, 1 << 20)
+                out.append((name, target))
+    else:
+        stage = tempfile.mkdtemp(dir=dest)
+        listfile = os.path.join(stage, ".members")
+        with open(listfile, "w") as f:
+            f.write("\n".join(m[0] for m in chosen) + "\n")
+        r = subprocess.run([sevenzip(), "x", "-y", "-o" + os.path.join(stage, "x"), "-i@" + listfile, "--", path],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise Stop("The 7z archive could not be unpacked.")
+        root = os.path.realpath(os.path.join(stage, "x"))
+        for name, _, _, _ in chosen:
+            p = os.path.join(root, name.replace("\\", "/"))
+            if os.path.islink(p) or not os.path.realpath(p).startswith(root + os.sep) or not os.path.isfile(p):
+                raise Stop("Refused: %s did not unpack as a plain file." % name)
+            target = unique(dest, os.path.basename(p), used)
+            os.replace(p, target)
+            out.append((name, target))
+    return out
+
+
+def unique(dest, base, used):
+    base = re.sub(r"[\x00-\x1f/]", "_", base) or "file"
+    name, n = base, 1
+    while name in used:
+        stem, ext = os.path.splitext(base)
+        name, n = "%s-%d%s" % (stem, n, ext), n + 1
+    used.add(name)
+    return os.path.join(dest, name)
+
+
+# ---- APK metadata ------------------------------------------------------------------------------
+
+def aapt():
+    for name in ("aapt2", "aapt"):
+        p = shutil.which(name)
+        if p:
+            return p
+    for root in (os.environ.get("ANDROID_SDK_ROOT"), os.environ.get("ANDROID_HOME"), "/opt/android-sdk"):
+        bt = os.path.join(root or "", "build-tools")
+        if root and os.path.isdir(bt):
+            for v in sorted(os.listdir(bt), reverse=True):
+                for name in ("aapt2", "aapt"):
+                    p = os.path.join(bt, v, name)
+                    if os.access(p, os.X_OK):
+                        return p
+    return None
+
+
+def apk_meta(path):
+    meta = {"name": os.path.basename(path), "package": None, "version_code": None, "version_name": None,
+            "min_sdk": None, "target_sdk": None, "abis": [], "split": None, "label": None}
+    tool = aapt()
+    if not tool:
+        return meta
+    r = subprocess.run([tool, "dump", "badging", os.path.abspath(path)], capture_output=True, text=True, errors="replace")
+    for line in r.stdout.splitlines():
+        if line.startswith("package:"):
+            for k, v in re.findall(r"(\w+)='([^']*)'", line):
+                if k == "name": meta["package"] = v
+                elif k == "versionCode": meta["version_code"] = v
+                elif k == "versionName": meta["version_name"] = v
+                elif k == "split": meta["split"] = v
+        elif re.match(r"^(sdkVersion|minSdkVersion):'", line):
+            v = re.findall(r"'(\d+)'", line)
+            meta["min_sdk"] = int(v[0]) if v else None
+        elif line.startswith("targetSdkVersion:"):
+            t = re.findall(r"'(\d+)'", line)
+            meta["target_sdk"] = int(t[0]) if t else None
+        elif line.startswith("native-code:"):
+            meta["abis"] = re.findall(r"'([^']+)'", line)
+        elif line.startswith("application-label:"):
+            meta["label"] = (re.findall(r"'([^']*)'", line) or [None])[0]
+    if meta["package"] and not PKG_RE.match(meta["package"]):
+        meta["package"] = None
+    return meta
+
+
+def obb_info(name, apk_pkg=None, apk_code=None, dest_pkg=None):
+    m = OBB_RE.match(name)
+    info = {"name": name, "kind": None, "version_code": None, "package": None, "dest_package": dest_pkg or apk_pkg, "match": None, "note": ""}
+    if not m:
+        info["note"] = "The name is not main|patch.<version>.<package>.obb, so it cannot be checked against the app."
+        return info
+    info.update(kind=m.group(1), version_code=m.group(2), package=m.group(3))
+    info["dest_package"] = info["dest_package"] or m.group(3)
+    if apk_pkg and m.group(3) != apk_pkg:
+        info["match"], info["note"] = False, "OBB is for %s, the app is %s." % (m.group(3), apk_pkg)
+    elif apk_code and m.group(2) != apk_code:
+        info["match"], info["note"] = False, ("OBB is for version %s, the app is version %s. This can be normal (an app "
+                                              "update may keep an older OBB), so check before pushing." % (m.group(2), apk_code))
+    elif apk_pkg:
+        info["match"] = True
+    return info
+
+
+def xapk_expansions(path, members):
+    """XAPK manifest.json names where each OBB belongs (Android/obb/<package>/<file>)."""
+    if not any(m[0] == "manifest.json" and m[1] < (1 << 20) for m in members) or not magic(path).startswith(b"PK"):
+        return {}
+    try:
+        with zipfile.ZipFile(path) as z:
+            data = json.loads(z.read("manifest.json").decode("utf-8", "replace"))
+    except (ValueError, KeyError, zipfile.BadZipFile):
+        return {}
+    out = {}
+    for e in data.get("expansions") or []:
+        dest = str(e.get("install_path") or "")
+        m = re.match(r"^Android/obb/([^/]+)/([^/]+)$", dest)
+        if m and PKG_RE.match(m.group(1)):
+            out[os.path.basename(str(e.get("file") or m.group(2)))] = m.group(1)
+    return out
+
+
+# ---- the plan ----------------------------------------------------------------------------------
+
+def analyse(path, workdir, extract_obbs=False, extra_obbs=()):
+    """Everything known about an input before touching the phone."""
+    path = norm_path(path)
+    kind, members = classify(path)
+    digest = sha256(path)
+    plan = {"file": path, "kind": kind, "size": os.path.getsize(path), "sha256": digest,
+            "checksum": checksum(path, digest), "apks": [], "obbs": [], "package": None,
+            "version_code": None, "warnings": [], "problems": [], "_apk_paths": [], "_obb_paths": []}
+    if plan["checksum"]["state"] == "mismatch":
+        plan["problems"].append("CHECKSUM MISMATCH against %s: the file is not the one the checksum describes." % plan["checksum"]["sidecar"])
+    if kind == "aab":
+        plan["problems"].append("This is an Android App Bundle (.aab), a publishing format. Phones cannot install it directly.")
+        return plan
+    if kind == "unknown":
+        plan["problems"].append("This file holds no APK or OBB.")
+        return plan
+    dest_for = {}
+    if kind == "apk":
+        plan["_apk_paths"] = [path]
+    elif kind == "obb":
+        plan["_obb_paths"] = [(os.path.basename(path), path)]
+    else:
+        dest_for = xapk_expansions(path, members)
+        plan["_apk_paths"] = [p for _, p in extract(path, members, (".apk",), workdir)]
+        if extract_obbs:
+            plan["_obb_paths"] = [(os.path.basename(p), p) for _, p in extract(path, members, (".obb",), workdir)]
+        else:
+            plan["_obb_paths"] = [(os.path.basename(m[0].replace("\\", "/")), None) for m in members if m[0].lower().endswith(".obb")]
+    for extra in extra_obbs:
+        plan["_obb_paths"] += obb_inputs(extra, workdir)
+    pkgs = set()
+    for p in plan["_apk_paths"]:
+        meta = apk_meta(p)
+        meta["sha256"] = sha256(p) if p != path else digest
+        plan["apks"].append(meta)
+        if meta["package"]:
+            pkgs.add(meta["package"])
+    if len(pkgs) > 1:
+        plan["problems"].append("The APKs are for different apps (%s); a split set must be one app." % ", ".join(sorted(pkgs)))
+    if plan["apks"]:
+        base = next((a for a in plan["apks"] if not a["split"]), plan["apks"][0])
+        plan["package"], plan["version_code"] = base["package"], base["version_code"]
+        if not aapt():
+            plan["warnings"].append("aapt2 is not installed, so package, version and ABI cannot be read before installing (arx install android-sdk-build-tools).")
+        if (base.get("target_sdk") or 99) < 23:
+            plan["warnings"].append("The app targets Android %s. Android 14 and newer block such old apps unless you allow it." % base["target_sdk"])
+    for name, p in plan["_obb_paths"]:
+        info = obb_info(name, plan["package"], plan["version_code"], dest_for.get(name))
+        info["size"] = os.path.getsize(p) if p else next((m[1] for m in members if os.path.basename(m[0].replace("\\", "/")) == name), None)
+        plan["obbs"].append(info)
+    return plan
+
+
+def obb_inputs(path, workdir):
+    """OBBs from a raw .obb or from a ZIP/7z holding them."""
+    path = norm_path(path)
+    kind, members = classify(path)
+    if kind == "obb":
+        return [(os.path.basename(path), path)]
+    if kind in ("bundle", "unknown") and members:
+        found = [(os.path.basename(p), p) for _, p in extract(path, members, (".obb",), workdir)]
+        if found:
+            return found
+    raise Stop("No OBB file found in %s." % os.path.basename(path))
+
+
+def public(plan):
+    return {k: v for k, v in plan.items() if not k.startswith("_")}
+
+
+# ---- the phone ---------------------------------------------------------------------------------
+
+def adb_bin():
+    p = shutil.which("adb")
+    if not p:
+        raise Stop("adb is not installed (arx install android-tools).")
+    return p
+
+
+def devices():
+    r = subprocess.run([adb_bin(), "devices"], capture_output=True, text=True, timeout=20)
+    out = []
+    for line in r.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            out.append((parts[0], parts[1]))
+    return out
+
+
+def pick_device(serial):
+    devs = devices()
+    if serial:
+        state = dict(devs).get(serial)
+        if state != "device":
+            raise Stop("Phone %s is not ready (%s)." % (serial, state or "not connected"))
+        return serial
+    ready = [s for s, st in devs if st == "device"]
+    if not ready:
+        if any(st == "unauthorized" for _, st in devs):
+            raise Stop("Allow USB debugging on the phone (accept the prompt), then try again.")
+        raise Stop("No phone connected. Turn on USB debugging and connect it.")
+    if len(ready) > 1:
+        raise Stop("More than one phone is connected; choose one.", need="device", devices=ready)
+    return ready[0]
+
+
+def adb(serial, *args, timeout=60):
+    try:
+        r = subprocess.run([adb_bin(), "-s", serial, *args], capture_output=True, text=True, timeout=timeout, errors="replace")
+    except subprocess.TimeoutExpired:
+        raise Stop("The phone did not answer in time.")
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def sh(serial, *parts, timeout=60):
+    """One command on the phone, every argument quoted for the phone's shell."""
+    return adb(serial, "shell", " ".join(shlex.quote(str(p)) for p in parts), timeout=timeout)
+
+
+def device_info(serial):
+    props = {}
+    for key in ("ro.product.manufacturer", "ro.product.model", "ro.build.version.release", "ro.build.version.sdk",
+                "ro.product.cpu.abi", "ro.product.cpu.abilist", "ro.build.display.id", "ro.build.version.security_patch"):
+        _, v = sh(serial, "getprop", key, timeout=20)
+        props[key] = v.strip()
+    sdk = props["ro.build.version.sdk"]
+    return {"serial": serial, "manufacturer": props["ro.product.manufacturer"], "model": props["ro.product.model"],
+            "android": props["ro.build.version.release"], "sdk": int(sdk) if sdk.isdigit() else None,
+            "abis": [a for a in props["ro.product.cpu.abilist"].split(",") if a] or [props["ro.product.cpu.abi"]],
+            "build": props["ro.build.display.id"], "security_patch": props["ro.build.version.security_patch"]}
+
+
+def failure_code(output):
+    m = re.search(r"(INSTALL_[A-Z_]+)", output or "")
+    return m.group(1) if m else None
+
+
+def install_apks(serial, apks, allow_downgrade, allow_old_target):
+    flags = (["-d"] if allow_downgrade else []) + (["--bypass-low-target-sdk-block"] if allow_old_target else [])
+    cmd = ["install", "-r", *flags, *apks] if len(apks) == 1 else ["install-multiple", "-r", *flags, *apks]
+    rc, out = adb(serial, *cmd, timeout=1800)
+    if rc == 0 and "Success" in out:
+        return out
+    code = failure_code(out)
+    if code == "INSTALL_FAILED_VERSION_DOWNGRADE" and not allow_downgrade:
+        raise Stop("The phone has a newer version of this app. Installing an older one is a downgrade.", need="downgrade", output=out)
+    if code == "INSTALL_FAILED_DEPRECATED_SDK_VERSION" and not allow_old_target:
+        raise Stop("Android blocks this app because it targets a very old Android version.", need="old_target", output=out)
+    raise Stop(FAILURES.get(code, "The install failed%s." % (" (%s)" % code if code else "")), code=code, output=out)
+
+
+def push_obbs(serial, obbs, package):
+    """Push each OBB to /sdcard/Android/obb/<package>/ under its own name and check its size."""
+    if not package or not PKG_RE.match(package):
+        raise Stop("The app's package name is unknown, so the OBB has no destination. Give it with --package.")
+    folder = "/sdcard/Android/obb/" + package
+    rc, out = sh(serial, "mkdir", "-p", folder)
+    if rc:
+        raise Stop("Could not create %s on the phone: %s" % (folder, out))
+    done = []
+    for name, local in obbs:
+        remote = folder + "/" + os.path.basename(name)
+        rc, out = adb(serial, "push", local, remote, timeout=3600)
+        if rc:
+            raise Stop("Copying %s to the phone failed: %s" % (name, out))
+        size = os.path.getsize(local)
+        _, got = sh(serial, "stat", "-c", "%s", remote)
+        ok = got.strip() == str(size)
+        if not ok:
+            raise Stop("%s arrived with a different size (%s bytes, expected %d). Try again; check free space." % (name, got.strip() or "unknown", size))
+        done.append({"name": name, "remote": remote, "size": size, "verified": True})
+    return done
+
+
+# ---- commands ----------------------------------------------------------------------------------
+
+def cmd_inspect(a):
+    with tempfile.TemporaryDirectory(prefix="inspect-", dir=workroot()) as w:
+        return public(analyse(a.file, w))
+
+
+def cmd_install(a):
+    with tempfile.TemporaryDirectory(prefix="install-", dir=workroot()) as w:
+        plan = analyse(a.file, w, extract_obbs=True, extra_obbs=a.obb or ())
+        if plan["problems"]:
+            raise Stop(" ".join(plan["problems"]), plan=public(plan))
+        if plan["kind"] == "obb":
+            raise Stop("This is an OBB, not an app. Use push-obb, or install the app with --obb.")
+        if not plan["_apk_paths"]:
+            raise Stop("No APK found.")
+        serial = pick_device(a.serial)
+        dev = device_info(serial)
+        base = next((x for x in plan["apks"] if not x["split"]), plan["apks"][0])
+        if dev["sdk"] and base.get("min_sdk") and dev["sdk"] < base["min_sdk"]:
+            raise Stop("The app needs Android SDK %d or newer; this phone has %d." % (base["min_sdk"], dev["sdk"]), plan=public(plan))
+        abis = {x for apk in plan["apks"] for x in apk["abis"]}
+        if abis and not abis & set(dev["abis"]):
+            raise Stop("This build is for %s; the phone is %s." % (", ".join(sorted(abis)), ", ".join(dev["abis"])), plan=public(plan))
+        bad = [o for o in plan["obbs"] if o["match"] is False]
+        if bad and not a.allow_obb_mismatch:
+            raise Stop("The OBB does not match the app: %s" % " ".join(o["note"] for o in bad), need="obb_mismatch", plan=public(plan))
+        out = install_apks(serial, plan["_apk_paths"], a.allow_downgrade, a.allow_old_target)
+        pushed = []
+        if plan["_obb_paths"]:
+            dest = next((o["dest_package"] for o in plan["obbs"] if o.get("dest_package")), None) or plan["package"]
+            pushed = push_obbs(serial, [(n, p) for n, p in plan["_obb_paths"] if p], plan["package"] or dest)
+        return {"ok": True, "package": plan["package"], "version_code": plan["version_code"], "device": dev,
+                "installed": [x["name"] for x in plan["apks"]], "obbs": pushed, "output": out, "plan": public(plan)}
+
+
+def cmd_push_obb(a):
+    with tempfile.TemporaryDirectory(prefix="obb-", dir=workroot()) as w:
+        path = norm_path(a.file)
+        digest = sha256(path)
+        check = checksum(path, digest)
+        if check["state"] == "mismatch":
+            raise Stop("CHECKSUM MISMATCH against %s." % check["sidecar"])
+        obbs = obb_inputs(path, w)
+        infos = [obb_info(n, a.package) for n, _ in obbs]
+        bad = [i for i in infos if i["match"] is False]
+        if bad and not a.allow_obb_mismatch:
+            raise Stop(" ".join(i["note"] for i in bad), need="obb_mismatch", obbs=infos)
+        package = a.package or next((i["package"] for i in infos if i["package"]), None)
+        serial = pick_device(a.serial)
+        return {"ok": True, "package": package, "sha256": digest, "checksum": check, "obbs": push_obbs(serial, obbs, package)}
+
+
+def cmd_scan(a):
+    d = norm_path(a.dir)
+    if not os.path.isdir(d):
+        raise Stop("No such folder: %s" % d)
+    found = []
+    for name in sorted(os.listdir(d)):
+        p = os.path.join(d, name)
+        if not os.path.isfile(p) or os.path.splitext(name)[1].lower() not in (".apk", ".xapk", ".apks", ".apkm", ".zip", ".7z", ".obb", ".aab"):
+            continue
+        try:
+            kind, members = classify(p)
+        except Stop:
+            continue
+        if kind == "unknown":
+            continue
+        found.append({"file": p, "name": name, "kind": kind, "size": os.path.getsize(p),
+                      "apks": sum(1 for m in members if m[0].lower().endswith(".apk")) if kind == "bundle" else (1 if kind == "apk" else 0),
+                      "obbs": sum(1 for m in members if m[0].lower().endswith(".obb")) if kind == "bundle" else (1 if kind == "obb" else 0)})
+    return {"ok": True, "dir": d, "items": found}
+
+
+def cmd_info(a):
+    return {"ok": True, "device": device_info(pick_device(a.serial))}
+
+
+def workroot():
+    os.makedirs(CACHE, exist_ok=True)
+    return CACHE
+
+
+# ---- interactive terminal use ------------------------------------------------------------------
+
+def ask(question, default=False):
+    if not sys.stdin.isatty():
+        return False
+    ans = input("%s [%s] " % (question, "Y/n" if default else "y/N")).strip().lower()
+    return default if not ans else ans in ("y", "yes")
+
+
+def describe(plan):
+    lines = ["File      %s" % plan["file"], "SHA-256   %s" % plan["sha256"]]
+    c = plan["checksum"]
+    lines.append("Checksum  %s" % {"match": "matches " + str(c["sidecar"]), "mismatch": "MISMATCH against " + str(c["sidecar"]),
+                                    "none": "no checksum file beside it (the hash above is for your own comparison)"}[c["state"]])
+    for x in plan["apks"]:
+        lines.append("APK       %s  %s %s (%s)%s%s" % (x["name"], x["package"] or "?", x["version_name"] or "?", x["version_code"] or "?",
+                                                    "  split " + x["split"] if x["split"] else "",
+                                                    "  ABI " + ",".join(x["abis"]) if x["abis"] else ""))
+    for o in plan["obbs"]:
+        lines.append("OBB       %s%s" % (o["name"], "  " + o["note"] if o["note"] else ""))
+    lines += ["Note      " + w for w in plan["warnings"]] + ["PROBLEM   " + p for p in plan["problems"]]
+    return "\n".join(lines)
+
+
+def run_interactive(a, func):
+    """The terminal flow: show what will happen, ask where the GUI would ask, retry with consent."""
+    if a.command == "install":
+        with tempfile.TemporaryDirectory(prefix="inspect-", dir=workroot()) as w:
+            plan = analyse(a.file, w, extra_obbs=a.obb or ())
+        print(describe(plan))
+        if plan["problems"]:
+            return 1
+        if plan["checksum"]["state"] == "none" and not ask("Install it?", True):
+            return 1
+    while True:
+        try:
+            result = func(a)
+        except Stop as s:
+            print("droidB-sideload: %s" % s, file=sys.stderr)
+            flag = {"downgrade": "allow_downgrade", "old_target": "allow_old_target", "obb_mismatch": "allow_obb_mismatch"}.get(s.need)
+            if flag and ask({"downgrade": "Install the older version anyway (keeps app data)?",
+                             "old_target": "Allow this old app anyway?",
+                             "obb_mismatch": "Push the OBB anyway?"}[s.need]):
+                setattr(a, flag, True)
+                continue
+            if s.need == "device":
+                print("Connected: %s. Choose one with --serial." % ", ".join(s.extra.get("devices", [])), file=sys.stderr)
+            return NEED_EXIT if s.need else 1
+        if a.command == "scan":
+            for i in result["items"]:
+                print("%-7s %s" % (i["kind"], i["file"]))
+        elif a.command == "inspect":
+            print(describe(result))
+        elif a.command == "info":
+            for k, v in result["device"].items():
+                print("%-15s %s" % (k, ", ".join(v) if isinstance(v, list) else v))
+        else:
+            print("Done: %s" % (result.get("package") or "OBB"))
+            for o in result.get("obbs", []):
+                print("OBB       %s -> %s (%d bytes, size checked)" % (o["name"], o["remote"], o["size"]))
+        return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="droidB-sideload", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version="droidB-sideload " + VERSION)
+    sub = p.add_subparsers(dest="command", required=True)
+    for name in ("inspect", "install", "push-obb", "scan", "info"):
+        s = sub.add_parser(name)
+        s.add_argument("--json", action="store_true")
+        if name == "scan":
+            s.add_argument("dir")
+        elif name != "info":
+            s.add_argument("file")
+        if name in ("install", "push-obb", "info"):
+            s.add_argument("--serial")
+        if name in ("install", "push-obb"):
+            s.add_argument("--allow-obb-mismatch", action="store_true")
+        if name == "install":
+            s.add_argument("--obb", action="append")
+            s.add_argument("--allow-downgrade", action="store_true")
+            s.add_argument("--allow-old-target", action="store_true")
+        if name == "push-obb":
+            s.add_argument("--package")
+    a = p.parse_args(argv)
+    if a.command == "push-obb" and a.package and not PKG_RE.match(a.package):
+        p.error("not a package name: %s" % a.package)
+    func = {"inspect": cmd_inspect, "install": cmd_install, "push-obb": cmd_push_obb, "scan": cmd_scan, "info": cmd_info}[a.command]
+    if not a.json:
+        return run_interactive(a, func)
+    try:
+        print(json.dumps(func(a)))
+        return 0
+    except Stop as s:
+        print(json.dumps({"ok": False, "error": str(s), "need": s.need, **s.extra}))
+        return NEED_EXIT if s.need else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""droidB-gms: Google Play services and microG on a phone, read and repaired over ADB.
+
+    droidB-gms status        [--json] [--serial S]
+    droidB-gms restore       [--json] [--serial S] PACKAGE
+    droidB-gms install-microg [--json] [--serial S] --gmscore APK [--companion APK] [--gsfproxy APK]
+    droidB-gms battery       [--json] [--serial S] [--apply]
+    droidB-gms game          [--json] APK
+    droidB-gms backup        [--json] [--serial S]
+    droidB-gms settings      [--json] [--serial S] PACKAGE
+
+status tells Google's services from microG apart (microG's packages carry org.microg components),
+shows versions, whether each is installed and enabled for the main user, whether the ROM offers
+signature spoofing and whether GmsCore holds it, and the battery exemptions. restore makes a
+package that is still in the system image available again for the main user (the reverse of a
+debloat). install-microg installs microG from APKs you downloaded from microG yourself; each APK
+must be the package its role expects. game reports which Google services an APK depends on.
+
+What this tool never does: patch the Android framework or services.jar, touch the boot image,
+bypass Play Integrity or Play licensing, or download APKs. Those can lock a phone in a boot loop
+or break an app's terms, and a working microG still cannot satisfy a server-side Play check.
+"""
+import argparse, datetime, importlib.machinery, importlib.util, json, os, re, sys, zipfile
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_loader = importlib.machinery.SourceFileLoader("droidb_sideload", os.path.join(_here, "droidB-sideload"))
+_spec = importlib.util.spec_from_loader("droidb_sideload", _loader)
+sl = importlib.util.module_from_spec(_spec)
+_loader.exec_module(sl)
+Stop, PKG_RE = sl.Stop, sl.PKG_RE
+
+VERSION = sl.VERSION
+COMPONENTS = [
+    ("com.google.android.gms", "Play services (GmsCore)"),
+    ("app.revanced.android.gms", "GmsCore (ReVanced build)"),
+    ("com.android.vending", "Play Store / microG Companion"),
+    ("com.google.android.gsf", "Services Framework / GsfProxy"),
+    ("com.google.android.play.games", "Play Games"),
+]
+EXPECTED = {"gmscore": ("com.google.android.gms", "app.revanced.android.gms"),
+            "companion": ("com.android.vending",),
+            "gsfproxy": ("com.google.android.gsf",)}
+BACKUPS = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "droidB", "gms-backups")
+SPOOF = "android.permission.FAKE_PACKAGE_SIGNATURE"
+# What a game's code or manifest names, and what that dependency means for running it without Google.
+GAME_SIGNS = [
+    (b"com.google.android.gms.games", "Play Games (sign-in, achievements, cloud saves)"),
+    (b"com.google.android.play.core.integrity", "Play Integrity (a server-side device check: microG cannot pass it)"),
+    (b"com.android.vending.CHECK_LICENSE", "Play licensing (the app asks the Play Store whether it was bought)"),
+    (b"com.google.android.vending.licensing", "Play licensing library"),
+    (b"com.google.android.play.core.assetpacks", "Play Asset Delivery (extra game data downloaded from Play)"),
+    (b"com.google.android.play.core.splitinstall", "Play Feature Delivery (parts of the app downloaded from Play)"),
+    (b"com.google.firebase", "Firebase (often messaging, analytics or remote config)"),
+    (b"com.google.android.gms.auth", "Google sign-in"),
+    (b"com.google.android.gms.ads", "Google ads"),
+    (b"com.google.android.gms.location", "Google location services"),
+    (b"com.google.android.c2dm", "Push messages through Google"),
+]
+
+
+def need_pkg(p):
+    if not p or not PKG_RE.match(p):
+        raise Stop("Not a package name: %s" % (p or "(empty)"))
+    return p
+
+
+def dumpsys(serial, pkg):
+    _, out = sl.sh(serial, "dumpsys", "package", pkg, timeout=60)
+    return out
+
+
+def listed(serial, *flags):
+    _, out = sl.sh(serial, "pm", "list", "packages", *flags, timeout=60)
+    return {l[len("package:"):].strip() for l in out.splitlines() if l.startswith("package:")}
+
+
+def component(serial, pkg, label, everything, user0, system, disabled):
+    info = {"package": pkg, "role": label, "present": pkg in everything, "installed_for_user": pkg in user0,
+            "system": pkg in system, "enabled": pkg in user0 and pkg not in disabled,
+            "version": None, "version_code": None, "flavor": None, "spoof_granted": None}
+    if not info["present"]:
+        return info
+    d = dumpsys(serial, pkg)
+    m = re.search(r"versionName=(\S+)", d)
+    info["version"] = m.group(1) if m else None
+    m = re.search(r"versionCode=(\d+)", d)
+    info["version_code"] = m.group(1) if m else None
+    info["flavor"] = "microG" if "org.microg." in d else ("Google" if pkg.startswith(("com.google.", "com.android.vending")) else "other")
+    m = re.search(re.escape(SPOOF) + r": granted=(true|false)", d)
+    info["spoof_granted"] = (m.group(1) == "true") if m else False
+    return info
+
+
+def status(serial):
+    everything = listed(serial, "-u")              # including packages removed for the user but kept in the image
+    user0 = listed(serial, "--user", "0")
+    system = listed(serial, "-s", "-u")
+    disabled = listed(serial, "-d", "--user", "0")
+    comps = [component(serial, p, label, everything, user0, system, disabled) for p, label in COMPONENTS]
+    _, perms = sl.sh(serial, "pm", "list", "permissions", timeout=60)
+    _, idle = sl.sh(serial, "dumpsys", "deviceidle", "whitelist", timeout=60)
+    exempt = {line.split(",")[1] for line in idle.splitlines() if line.count(",") >= 1}
+    for c in comps:
+        c["battery_exempt"] = c["package"] in exempt if c["installed_for_user"] else None
+    gms = next((c for c in comps if c["package"] == "com.google.android.gms" and c["present"]), None) \
+        or next((c for c in comps if c["package"] == "app.revanced.android.gms" and c["present"]), None)
+    spoof_offered = SPOOF in perms
+    if not gms:
+        summary = "No Play services or microG on this phone."
+    elif gms["flavor"] == "microG":
+        summary = "microG is installed." + ("" if gms["installed_for_user"] else " It is removed for this user; restore it.")
+        if not spoof_offered:
+            summary += " The ROM does not offer signature spoofing, so most microG features cannot work."
+        elif not gms["spoof_granted"]:
+            summary += " Signature spoofing is offered but not granted to microG: allow it in microG's Self-Check."
+    else:
+        summary = "Google Play services is installed." + ("" if gms["installed_for_user"] else " It is removed for this user; restore it.")
+    return {"ok": True, "device": sl.device_info(serial), "components": comps, "spoof_offered": spoof_offered, "summary": summary}
+
+
+def cmd_status(a):
+    return status(sl.pick_device(a.serial))
+
+
+def cmd_restore(a):
+    pkg = need_pkg(a.package)
+    serial = sl.pick_device(a.serial)
+    if pkg not in listed(serial, "-s", "-u"):
+        raise Stop("%s is not in this phone's system image, so there is nothing to restore. Install it as an app instead." % pkg)
+    rc, out = sl.sh(serial, "cmd", "package", "install-existing", "--user", "0", pkg)
+    if rc or "installed for user" not in out.lower() and "success" not in out.lower():
+        raise Stop("Android did not restore %s: %s" % (pkg, out or "no answer"))
+    sl.sh(serial, "pm", "enable", "--user", "0", pkg)
+    return {"ok": True, "package": pkg, "output": out}
+
+
+def check_role(path, role, workdir):
+    """An APK given for a microG role must be that role's package; read and checked before install."""
+    plan = sl.analyse(path, workdir)
+    if plan["problems"]:
+        raise Stop("%s: %s" % (os.path.basename(path), " ".join(plan["problems"])))
+    if plan["kind"] != "apk":
+        raise Stop("%s is not a single APK." % os.path.basename(path))
+    if not plan["package"]:
+        raise Stop("Cannot read the package name of %s (install aapt2: arx install android-sdk-build-tools)." % os.path.basename(path))
+    if plan["package"] not in EXPECTED[role]:
+        raise Stop("%s is %s, not %s. Check that you picked the right microG file." % (os.path.basename(path), plan["package"], " or ".join(EXPECTED[role])))
+    return plan
+
+
+def cmd_install_microg(a):
+    with sl.tempfile.TemporaryDirectory(prefix="microg-", dir=sl.workroot()) as w:
+        roles = [("gmscore", a.gmscore), ("companion", a.companion), ("gsfproxy", a.gsfproxy)]
+        plans = [(r, check_role(sl.norm_path(p), r, w)) for r, p in roles if p]
+        serial = sl.pick_device(a.serial)
+        dev = sl.device_info(serial)
+        current = {c["package"]: c for c in status(serial)["components"]}
+        done = []
+        for role, plan in plans:
+            have = current.get(plan["package"])
+            if have and have["present"] and have["flavor"] == "Google":
+                raise Stop("Google's own %s is on this phone. microG cannot replace it (different signer): "
+                           "remove Google's package for this user first, or use a ROM made for microG." % plan["package"])
+            # GsfProxy targets an old Android; Android 14+ refuses that unless the old-target block is lifted.
+            old_ok = a.allow_old_target or (role == "gsfproxy" and (dev["sdk"] or 0) >= 34)
+            out = sl.install_apks(serial, [plan["file"]], False, old_ok)
+            done.append({"role": role, "package": plan["package"], "sha256": plan["sha256"], "checksum": plan["checksum"]["state"], "output": out})
+        return {"ok": True, "installed": done, "next": "Open microG on the phone, run its Self-Check, allow what it asks, then restart the phone."}
+
+
+def cmd_battery(a):
+    serial = sl.pick_device(a.serial)
+    comps = [c for c in status(serial)["components"] if c["installed_for_user"]]
+    changed = []
+    if a.apply:
+        for c in comps:
+            if not c["battery_exempt"]:
+                rc, out = sl.sh(serial, "cmd", "deviceidle", "whitelist", "+" + c["package"])
+                if rc:
+                    raise Stop("Could not exempt %s: %s" % (c["package"], out))
+                changed.append(c["package"])
+    return {"ok": True, "changed": changed,
+            "exempt": {c["package"]: (c["battery_exempt"] or c["package"] in changed) for c in comps}}
+
+
+def cmd_game(a):
+    path = sl.norm_path(a.file)
+    kind, members = sl.classify(path)
+    if kind != "apk":
+        raise Stop("Give the game's APK (for a bundle, its base APK).")
+    found = {}
+    with zipfile.ZipFile(path) as z:
+        for name, size, _, _ in members:
+            if not (name == "AndroidManifest.xml" or re.match(r"^classes\d*\.dex$", name)) or size > (512 << 20):
+                continue
+            data = z.read(name)
+            # dex and binary XML strings may be UTF-16 (manifest) or MUTF-8 (dex): look for both
+            for sign, meaning in GAME_SIGNS:
+                if sign in data or sign.decode().encode("utf-16-le") in data or sign.replace(b".", b"/") in data:
+                    found[meaning] = True
+    meta = sl.apk_meta(path)
+    deps = list(found)
+    hard = [d for d in deps if d.startswith(("Play Integrity", "Play licensing"))]
+    verdict = ("No Google service names found in the code. That is a hint, not proof: code can load services by other means." if not deps
+               else "Needs checks microG cannot answer: %s." % "; ".join(hard) if hard
+               else "Uses Google services microG can often provide. Install microG and test the game.")
+    return {"ok": True, "file": path, "package": meta["package"], "version": meta["version_name"], "sha256": sl.sha256(path),
+            "depends_on": deps, "verdict": verdict}
+
+
+def cmd_backup(a):
+    serial = sl.pick_device(a.serial)
+    st = status(serial)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    folder = os.path.join(BACKUPS, "%s-%s" % (stamp, re.sub(r"[^A-Za-z0-9._-]", "_", serial)))
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "status.json"), "w") as f:
+        json.dump(st, f, indent=2)
+    for c in st["components"]:
+        if c["present"]:
+            with open(os.path.join(folder, c["package"] + ".dumpsys.txt"), "w") as f:
+                f.write(dumpsys(serial, c["package"]))
+    return {"ok": True, "folder": folder, "files": sorted(os.listdir(folder))}
+
+
+def cmd_settings(a):
+    pkg = need_pkg(a.package)
+    serial = sl.pick_device(a.serial)
+    rc, out = sl.sh(serial, "am", "start", "-a", "android.settings.APPLICATION_DETAILS_SETTINGS", "-d", "package:" + pkg)
+    if rc or "Error" in out:
+        raise Stop("Could not open the settings of %s: %s" % (pkg, out))
+    return {"ok": True, "package": pkg}
+
+
+def show(result, command):
+    if command == "status":
+        print(result["summary"])
+        print("Signature spoofing offered by the ROM: %s" % ("yes" if result["spoof_offered"] else "no"))
+        for c in result["components"]:
+            if not c["present"]:
+                print("  %-31s not on the phone" % c["package"])
+                continue
+            state = ("enabled" if c["enabled"] else "disabled") if c["installed_for_user"] else "removed for this user"
+            print("  %-31s %-7s %-16s %s%s" % (c["package"], c["flavor"], c["version"] or "?", state,
+                                              ", battery exempt" if c.get("battery_exempt") else ""))
+    elif command == "game":
+        print("%s %s" % (result["package"] or "?", result["version"] or ""))
+        for d in result["depends_on"]:
+            print("  uses: %s" % d)
+        print(result["verdict"])
+    else:
+        print(json.dumps(result, indent=2))
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="droidB-gms", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version="droidB-gms " + VERSION)
+    sub = p.add_subparsers(dest="command", required=True)
+    for name in ("status", "restore", "install-microg", "battery", "game", "backup", "settings"):
+        s = sub.add_parser(name)
+        s.add_argument("--json", action="store_true")
+        if name != "game":
+            s.add_argument("--serial")
+        if name in ("restore", "settings"):
+            s.add_argument("package")
+        if name == "game":
+            s.add_argument("file")
+        if name == "battery":
+            s.add_argument("--apply", action="store_true")
+        if name == "install-microg":
+            s.add_argument("--gmscore", required=True)
+            s.add_argument("--companion")
+            s.add_argument("--gsfproxy")
+            s.add_argument("--allow-old-target", action="store_true")
+    a = p.parse_args(argv)
+    func = {"status": cmd_status, "restore": cmd_restore, "install-microg": cmd_install_microg, "battery": cmd_battery,
+            "game": cmd_game, "backup": cmd_backup, "settings": cmd_settings}[a.command]
+    try:
+        result = func(a)
+    except Stop as s:
+        if a.json:
+            print(json.dumps({"ok": False, "error": str(s), "need": s.need, **s.extra}))
+        else:
+            print("droidB-gms: %s" % s, file=sys.stderr)
+        return sl.NEED_EXIT if s.need else 1
+    if a.json:
+        print(json.dumps(result))
+    else:
+        show(result, a.command)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

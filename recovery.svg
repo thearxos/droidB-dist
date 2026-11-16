@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="46%" r="70%">
+      <stop offset="0%" stop-color="#0e1a12"/>
+      <stop offset="55%" stop-color="#080d0a"/>
+      <stop offset="100%" stop-color="#050806"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#3ddc84" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#3ddc84" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="droid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#5cf09a"/>
+      <stop offset="100%" stop-color="#2fae67"/>
+    </linearGradient>
+    <filter id="soft"><feGaussianBlur stdDeviation="0.6"/></filter>
+  </defs>
+  <rect width="1280" height="800" fill="url(#bg)"/>
+  <ellipse cx="640" cy="380" rx="520" ry="360" fill="url(#glow)"/>
+
+  <!-- android lying on its back, head to the left, hatch open showing gears -->
+  <g transform="translate(640 400)">
+    <!-- subtle ground shadow -->
+    <ellipse cx="0" cy="150" rx="430" ry="42" fill="#000000" opacity="0.45"/>
+
+    <!-- legs (pointing right, it's lying down) -->
+    <rect x="250" y="-58" width="120" height="46" rx="23" fill="url(#droid)"/>
+    <rect x="250" y="14"  width="120" height="46" rx="23" fill="url(#droid)"/>
+    <!-- far arm -->
+    <rect x="-40" y="92" width="46" height="150" rx="23" fill="#2c9d5c"/>
+
+    <!-- body (torso) -->
+    <rect x="-150" y="-110" width="430" height="220" rx="60" fill="url(#droid)"/>
+
+    <!-- open hatch: dark cavity in the belly -->
+    <rect x="-70" y="-70" width="250" height="150" rx="22" fill="#06100b"/>
+    <rect x="-70" y="-70" width="250" height="150" rx="22" fill="none" stroke="#1d8048" stroke-width="6"/>
+    <!-- hatch lid swung open above -->
+    <g transform="rotate(-24 -70 -70)">
+      <rect x="-70" y="-150" width="250" height="74" rx="18" fill="#34b86e"/>
+      <rect x="-70" y="-150" width="250" height="74" rx="18" fill="none" stroke="#1d8048" stroke-width="5"/>
+    </g>
+    <!-- gears / guts inside the cavity -->
+    <g fill="#8affc0">
+      <g transform="translate(-5 5)">
+        <circle r="42" fill="#1c8a4e"/><circle r="20" fill="#06100b"/>
+        <g stroke="#1c8a4e" stroke-width="14"><line x1="-54" y1="0" x2="54" y2="0"/><line x1="0" y1="-54" x2="0" y2="54"/><line x1="-38" y1="-38" x2="38" y2="38"/><line x1="-38" y1="38" x2="38" y2="-38"/></g>
+        <circle r="42" fill="none" stroke="#52e08c" stroke-width="6"/>
+      </g>
+      <g transform="translate(112 26)">
+        <circle r="30" fill="#1c8a4e"/><circle r="13" fill="#06100b"/>
+        <g stroke="#1c8a4e" stroke-width="11"><line x1="-38" y1="0" x2="38" y2="0"/><line x1="0" y1="-38" x2="0" y2="38"/><line x1="-27" y1="-27" x2="27" y2="27"/><line x1="-27" y1="27" x2="27" y2="-27"/></g>
+        <circle r="30" fill="none" stroke="#52e08c" stroke-width="5"/>
+      </g>
+    </g>
+    <!-- screwdriver doing the repair -->
+    <g transform="rotate(38 150 -40)">
+      <rect x="150" y="-150" width="16" height="120" rx="6" fill="#cfd6cf"/>
+      <rect x="146" y="-178" width="24" height="36" rx="8" fill="#ff8c2a"/>
+    </g>
+
+    <!-- head dome (left), lying so the dome faces left -->
+    <path d="M -150 -90 a 110 110 0 0 0 -110 110 v 18 h 110 z" fill="url(#droid)"/>
+    <!-- eyes -->
+    <circle cx="-225" cy="0" r="11" fill="#06100b"/>
+    <circle cx="-210" cy="48" r="11" fill="#06100b"/>
+    <!-- antennae -->
+    <line x1="-235" y1="-70" x2="-285" y2="-118" stroke="#2fae67" stroke-width="11" stroke-linecap="round"/>
+    <line x1="-262" y1="-44" x2="-322" y2="-74" stroke="#2fae67" stroke-width="11" stroke-linecap="round"/>
+  </g>
+</svg>

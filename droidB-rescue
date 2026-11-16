@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# droidB-rescue 0.0.1 - emergency device backup + ADB access failsafe.
+# Run this BEFORE any risky flash/root/tinker: it pulls the irreplaceable user data to a
+# timestamped folder so a brick can never cost you your contacts, calls, texts or photos.
+#
+#   contacts, call logs, SMS        via content providers (adb shell has the read perms)
+#   media                           DCIM/Pictures/Movies/Music/Download/Documents/WhatsApp...
+#   app inventory                   full + user-only package lists (so you know what to reinstall)
+#   app data (best-effort)          adb backup -all (needs the on-screen confirm; skipped if it can't)
+#
+# ADB auth failsafe:
+#   --authorize  pushes THIS pc's adb public key onto the device (/data/misc/adb/adb_keys) so
+#                the shell trusts this host with no on-screen "Allow USB debugging?" prompt -
+#                the way in when the screen is cracked/black. Needs root or a recovery adb shell.
+#
+# Usage:
+#   droidB-rescue [--out DIR] [--authorize] [--media-only] [--no-media] [--no-appdata]
+set -u
+GR=$'\033[1;32m'; RD=$'\033[1;31m'; DM=$'\033[90m'; AC=$'\033[38;5;208m'; BD=$'\033[1m'; RS=$'\033[0m'
+say(){ printf "  ${GR}>>${RS} %s\n" "$*"; }
+err(){ printf "  ${RD}xx${RS} %s\n" "$*"; }
+inf(){ printf "  ${DM}.. %s${RS}\n" "$*"; }
+
+OUT=""; AUTH=0; MEDIA=1; APPDATA=1; MISC=1
+while [ $# -gt 0 ]; do case "$1" in
+  --out) OUT="${2:-}"; shift 2;;
+  --authorize) AUTH=1; shift;;
+  --media-only) MISC=0; APPDATA=0; shift;;
+  --no-media) MEDIA=0; shift;;
+  --no-appdata) APPDATA=0; shift;;
+  *) err "unknown arg: $1"; exit 1;;
+esac; done
+
+command -v adb >/dev/null 2>&1 || { err "adb not found (arx install android-tools)"; exit 1; }
+ashell(){ adb shell "$@" 2>/dev/null | tr -d '\r'; }
+
+state=$(adb get-state 2>/dev/null || echo offline)
+[ "$state" = "device" ] || [ "$state" = "recovery" ] || {
+  err "no adb device (state: $state). Enable USB debugging, or boot recovery for recovery-adb."
+  err "on a broken screen: boot recovery via hardware keys, then re-run (recovery adb needs no toggle)."
+  exit 1
+}
+
+# ---- ADB auth failsafe -----------------------------------------------------
+authorize(){
+  local key="$HOME/.android/adbkey" pub="$HOME/.android/adbkey.pub"
+  adb start-server >/dev/null 2>&1
+  [ -f "$pub" ] || adb keygen "$key" >/dev/null 2>&1 || true
+  [ -f "$pub" ] || { err "no adb public key at $pub and none could be generated"; return 1; }
+  say "injecting this PC's adb key so the device trusts it without the on-screen prompt"
+  # push to the trust store; needs root (normal rooted device) or a recovery adb shell
+  if adb push "$pub" /data/misc/adb/adb_keys >/dev/null 2>&1 \
+     || ashell "mkdir -p /data/misc/adb && cat > /data/misc/adb/adb_keys" < "$pub" ; then
+    ashell "chmod 640 /data/misc/adb/adb_keys; chown system:shell /data/misc/adb/adb_keys; restorecon /data/misc/adb/adb_keys" >/dev/null 2>&1
+    say "adb key installed -> shell access will persist (survives a locked/cracked screen)"
+  else
+    err "could not write /data/misc/adb/adb_keys (need root or a recovery adb shell with /data mounted)"
+    return 1
+  fi
+}
+[ "$AUTH" = 1 ] && { authorize; [ "$MEDIA$MISC$APPDATA" = "000" ] && exit 0; }
+
+# ---- backup ----------------------------------------------------------------
+MODEL=$(ashell getprop ro.product.model | tr ' ' '_'); MODEL="${MODEL:-device}"
+OUT="${OUT:-$HOME/droidB-rescue/${MODEL}-$(date +%Y%m%d-%H%M%S)}"
+mkdir -p "$OUT"
+say "backing up to ${AC}$OUT${RS}"
+
+# device fingerprint + app inventory (so you can rebuild the phone later)
+inf "device properties + app inventory"
+ashell getprop > "$OUT/device-props.txt"
+ashell pm list packages -f    > "$OUT/apps-all.txt"
+ashell pm list packages -3 -f > "$OUT/apps-user.txt"
+ashell settings list global   > "$OUT/settings-global.txt"
+ashell settings list secure   > "$OUT/settings-secure.txt"
+
+if [ "$MISC" = 1 ]; then
+  inf "contacts"
+  ashell content query --uri content://com.android.contacts/data \
+    --projection "display_name:data1:mimetype" > "$OUT/contacts.txt"
+  inf "call logs"
+  ashell content query --uri content://call_log/calls \
+    --projection "number:name:type:date:duration" > "$OUT/call-logs.txt"
+  inf "SMS messages"
+  ashell content query --uri content://sms \
+    --projection "address:date:type:body" > "$OUT/sms.txt"
+  for f in contacts call-logs sms; do
+    [ -s "$OUT/$f.txt" ] || echo "(empty or permission-limited on this Android version)" > "$OUT/$f.txt"
+  done
+fi
+
+if [ "$MEDIA" = 1 ]; then
+  say "pulling media (this is the slow part - do not unplug)"
+  mkdir -p "$OUT/media"
+  for d in DCIM Pictures Movies Music Download Documents Recordings Ringtones \
+           WhatsApp "Android/media/com.whatsapp"; do
+    ashell "[ -d /sdcard/$d ]" && echo 0 >/dev/null && {
+      inf "media/$d"; adb pull "/sdcard/$d" "$OUT/media/" >/dev/null 2>&1 || true; }
+  done
+fi
+
+if [ "$APPDATA" = 1 ]; then
+  inf "app data via adb backup (confirm the prompt on the phone; leave the password blank)"
+  # deprecated on newer Android + needs on-device confirmation; best-effort with a short guard
+  timeout 240 adb backup -all -apk -shared -f "$OUT/appdata.ab" >/dev/null 2>&1 || true
+  if [ -s "$OUT/appdata.ab" ]; then say "app data -> appdata.ab"; else
+    rm -f "$OUT/appdata.ab"; inf "adb backup unavailable on this device (Android 12+ removed it) - skipped"; fi
+fi
+
+# manifest
+{
+  echo "droidB-rescue backup"; echo "date:   $(date)"; echo "device: $MODEL"
+  echo "state:  $state"; echo "files:"; find "$OUT" -maxdepth 2 -type f -printf "  %s\t%p\n" 2>/dev/null
+} > "$OUT/MANIFEST.txt"
+
+SZ=$(du -sh "$OUT" 2>/dev/null | cut -f1)
+printf "\n"; say "rescue backup complete (${AC}${SZ:-?}${RS}) -> $OUT"
+say "safe to flash now. restore media by pushing it back; reinstall apps from apps-user.txt."
